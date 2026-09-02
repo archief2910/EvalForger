@@ -1,0 +1,15 @@
+.env
+*.db
+*.db-wal
+*.db-shm
+data/
+data-test/
+server-go/orchestrator.exe
+node_modules/
+dist/
+__pycache__/
+*.log
+uvicorn.log
+vite.log
+screenshots/
+server-go/evalforge.exe
