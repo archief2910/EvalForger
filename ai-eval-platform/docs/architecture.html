@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>EvalForge — System Architecture</title>
+<style>
+  :root {
+    --bg: #0e1014; --panel: #161a21; --panel2: #1c212b; --line: #2b3240;
+    --text: #e6e9ef; --muted: #8b93a7; --accent: #5b8def; --green: #3fb950;
+    --amber: #d29922; --red: #f85149; --purple: #a371f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 14px/1.5 "Inter", "Segoe UI", system-ui, sans-serif;
+    padding: 26px 30px 40px;
+  }
+  h1 { font-size: 21px; margin: 0 0 4px; letter-spacing: -0.2px; }
+  .sub { color: var(--muted); margin: 0 0 18px; font-size: 13px; }
+  .legend { display: flex; gap: 22px; flex-wrap: wrap; margin: 0 0 10px; color: var(--muted); font-size: 12px; }
+  .legend span { display: inline-flex; align-items: center; gap: 7px; }
+  .swatch { width: 22px; height: 0; border-top: 2px solid var(--muted); }
+  .swatch.dashed { border-top-style: dashed; }
+  svg { width: 100%; height: auto; display: block; }
+  text { font-family: "Inter", "Segoe UI", system-ui, sans-serif; }
+  .t { fill: var(--text); }
+  .m { fill: var(--muted); }
+  .box { fill: var(--panel); stroke: var(--line); stroke-width: 1; }
+  .box2 { fill: var(--panel2); stroke: var(--line); stroke-width: 1; }
+  .boxgo { fill: #16202e; stroke: #2f4d78; }
+  .boxdb { fill: #1a1f1a; stroke: #2f4a33; }
+  .boxpy { fill: #1b1a24; stroke: #3d3555; }
+  .boxllm { fill: #211c18; stroke: #4a3b28; }
+  .title { font-size: 13px; font-weight: 700; }
+  .body { font-size: 10.5px; }
+  .lbl { font-size: 9.5px; }
+  .arrow { stroke: var(--accent); stroke-width: 1.6; fill: none; }
+  .arrowd { stroke: var(--amber); stroke-width: 1.5; fill: none; stroke-dasharray: 5 4; }
+  .arrows { stroke: var(--green); stroke-width: 1.6; fill: none; }
+  .arrowp { stroke: var(--purple); stroke-width: 1.6; fill: none; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 14px; }
+  code { color: var(--text); background: #1b2029; padding: 1px 5px; border-radius: 4px; font-size: 11.5px; }
+</style>
+</head>
+<body>
+
+<h1>EvalForge — high-level architecture</h1>
+<p class="sub">Two processes and a file: a Go API server owns the data, a Python worker executes evaluations, a React SPA drives the loop.</p>
+
+<div class="legend">
+  <span><i class="swatch"></i> HTTP call</span>
+  <span><i class="swatch dashed"></i> callback / re-entrant API call</span>
+  <span><i class="swatch" style="border-color:#3fb950"></i> SQL</span>
+  <span><i class="swatch" style="border-color:#a371f7"></i> subprocess spawn</span>
+</div>
+
+<svg viewBox="0 0 1240 800" role="img" aria-label="Architecture diagram">
+  <defs>
+    <marker id="ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#5b8def"/>
+    </marker>
+    <marker id="ahd" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#d29922"/>
+    </marker>
+    <marker id="ahs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#3fb950"/>
+    </marker>
+    <marker id="ahp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#a371f7"/>
+    </marker>
+  </defs>
+
+  <!-- ── instrumentation ── -->
+  <rect class="box" x="24" y="80" width="240" height="118" rx="10"/>
+  <text class="t title" x="40" y="106">Your app / agent</text>
+  <text class="m body" x="40" y="126">Python SDK sample · sdk/sample_client.py</text>
+  <text class="m body" x="40" y="144">start_span() / end() → parent stack</text>
+  <text class="m body" x="40" y="160">in-memory buffer → flush() batch</text>
+  <text class="m body" x="40" y="176">durability starts on HTTP 200</text>
+
+  <!-- ── browser ── -->
+  <rect class="box" x="24" y="252" width="240" height="262" rx="10"/>
+  <text class="t title" x="40" y="278">React 19 + Vite SPA</text>
+  <text class="m body" x="40" y="296">:5173 · dev proxy /api → :8000</text>
+  <text class="m body" x="40" y="322">Dashboard — latency, cost, models</text>
+  <text class="m body" x="40" y="340">Logs &amp; Traces — filters, sort</text>
+  <text class="m body" x="40" y="358">Trace viewer — nested span tree</text>
+  <text class="m body" x="40" y="376">Review — thumbs, corrected expected</text>
+  <text class="m body" x="40" y="394">Datasets — records, promote from trace</text>
+  <text class="m body" x="40" y="412">Experiments — run, poll, compare</text>
+  <text class="m body" x="40" y="430">Prompts — versioned templates</text>
+  <text class="m body" x="40" y="462" style="fill:#8b93a7">talks JSON only — no server state</text>
+  <text class="m body" x="40" y="480">held in the page</text>
+
+  <!-- ── go api ── -->
+  <rect class="boxgo" x="350" y="80" width="350" height="560" rx="12"/>
+  <text class="t title" x="368" y="108">Go API server — :8000</text>
+  <text class="m body" x="368" y="126">net/http · modernc.org/sqlite (pure Go, no cgo)</text>
+
+  <rect class="box2" x="366" y="140" width="318" height="40" rx="7"/>
+  <text class="t body" x="380" y="156">routing /api/v1/* · request-id · access log · CORS</text>
+  <text class="m lbl" x="380" y="171">single mux · MCP via --mcp (stdio) + POST /mcp (OAuth 2.1)</text>
+
+  <rect class="box2" x="366" y="188" width="318" height="52" rx="7"/>
+  <text class="t body" x="380" y="204">ingest — spans:ingest + OTLP /v1/traces</text>
+  <text class="m lbl" x="380" y="219">2-pass trace-id resolve → one transaction →</text>
+  <text class="m lbl" x="380" y="232">root rollup · protobuf + JSON, idempotent by span id</text>
+
+  <rect class="box2" x="366" y="248" width="318" height="40" rx="7"/>
+  <text class="t body" x="380" y="264">queries — trace list · span tree · dashboard</text>
+  <text class="m lbl" x="380" y="279">model + cost aggregated across the trace</text>
+
+  <rect class="box2" x="366" y="296" width="318" height="40" rx="7"/>
+  <text class="t body" x="380" y="312">datasets · records · promotion · prompts</text>
+  <text class="m lbl" x="380" y="327">records: single object or batch array</text>
+
+  <rect class="box2" x="366" y="344" width="318" height="52" rx="7"/>
+  <text class="t body" x="380" y="360">job queue — claim · lease · reap</text>
+  <text class="m lbl" x="380" y="375">experiment + job in one tx → dispatcher →</text>
+  <text class="m lbl" x="380" y="388">heartbeat · 1 retry · crash requeue</text>
+
+  <rect class="box2" x="366" y="404" width="318" height="40" rx="7"/>
+  <text class="t body" x="380" y="420">worker callback</text>
+  <text class="m lbl" x="380" y="435">delete + insert runs in a tx (idempotent)</text>
+
+  <text class="m body" x="368" y="478">SQLite WAL · 8-conn pool · dbMu serialises writes</text>
+  <text class="m body" x="368" y="498">.env loaded at boot · key never logged</text>
+  <text class="m body" x="368" y="518">GO_SERVER handed to the worker (non-default port safe)</text>
+  <text class="m body" x="368" y="546" style="fill:#8b93a7">AUTH_MODE=required: API keys + OAuth PKCE · project-scoped keys</text>
+
+  <!-- ── sqlite ── -->
+  <rect class="boxdb" x="760" y="80" width="230" height="212" rx="10"/>
+  <text class="t title" x="776" y="106">SQLite</text>
+  <text class="m body" x="776" y="123">data/ai_eval.db</text>
+  <text class="m lbl" x="776" y="147">projects      feedback</text>
+  <text class="m lbl" x="776" y="163">spans         datasets</text>
+  <text class="m lbl" x="776" y="179">dataset_records</text>
+  <text class="m lbl" x="776" y="195">experiments   eval_runs</text>
+  <text class="m lbl" x="776" y="211">prompts       model_prices</text>
+  <text class="m lbl" x="776" y="227">scorers  (unused)   jobs (durable)</text>
+  <text class="m lbl" x="776" y="252">journal: WAL · busy_timeout 5000</text>
+  <text class="m lbl" x="776" y="267">JSON columns for every payload</text>
+  <text class="m lbl" x="776" y="282">root span == trace row</text>
+
+  <!-- ── python worker ── -->
+  <rect class="boxpy" x="760" y="330" width="230" height="196" rx="10"/>
+  <text class="t title" x="776" y="356">Python eval worker</text>
+  <text class="m body" x="776" y="373">worker-py/worker.py</text>
+  <text class="m lbl" x="776" y="396">one subprocess per experiment</text>
+  <text class="m lbl" x="776" y="412">4 records in parallel (thread pool)</text>
+  <text class="m lbl" x="776" y="428">6 deterministic scorers</text>
+  <text class="m lbl" x="776" y="444">2 LLM judges (factuality, helpful)</text>
+  <text class="m lbl" x="776" y="460">judge_mode on every score</text>
+  <text class="m lbl" x="776" y="476">offline simulator if no key</text>
+  <text class="m lbl" x="776" y="492">retry + token-budget escalation</text>
+  <text class="m lbl" x="776" y="514" style="fill:#8b93a7">stdlib only · replaceable</text>
+
+  <!-- ── provider ── -->
+  <rect class="boxllm" x="1030" y="350" width="190" height="130" rx="10"/>
+  <text class="t title" x="1046" y="376">OpenRouter</text>
+  <text class="m body" x="1046" y="394">chat/completions</text>
+  <text class="m lbl" x="1046" y="414">model: openrouter/free</text>
+  <text class="m lbl" x="1046" y="430">(fixed literal)</text>
+  <text class="m lbl" x="1046" y="452">routes to a free pool</text>
+  <text class="m lbl" x="1046" y="468">varying model per call</text>
+
+  <!-- ── arrows ── -->
+  <line class="arrow" x1="264" y1="146" x2="346" y2="146" marker-end="url(#ah)"/>
+  <text class="m lbl" x="262" y="139">spans:ingest · OTLP</text>
+
+  <line class="arrow" x1="264" y1="386" x2="346" y2="386" marker-end="url(#ah)"/>
+  <text class="m lbl" x="272" y="379">/api/v1/*</text>
+
+  <line class="arrows" x1="700" y1="170" x2="756" y2="170" marker-end="url(#ahs)"/>
+  <text class="m lbl" x="706" y="160">SQL</text>
+
+  <line class="arrowp" x1="700" y1="436" x2="756" y2="436" marker-end="url(#ahp)"/>
+  <text class="m lbl" x="706" y="429">exec</text>
+
+  <line class="arrowd" x1="756" y1="474" x2="704" y2="474" marker-end="url(#ahd)"/>
+  <text class="m lbl" x="698" y="490">callback</text>
+
+  <line class="arrow" x1="990" y1="400" x2="1026" y2="400" marker-end="url(#ah)"/>
+  <text class="m lbl" x="992" y="390">HTTPS</text>
+
+  <!-- ── the loop ── -->
+  <line x1="24" y1="652" x2="1216" y2="652" stroke="#2b3240" stroke-width="1"/>
+  <text class="t" x="24" y="680" style="font-size:12px;font-weight:600">The product loop — why the pieces exist</text>
+
+  <g>
+    <rect class="box" x="24" y="694" width="176" height="56" rx="8"/>
+    <text class="t body" x="38" y="714">1 · Instrument</text>
+    <text class="m lbl" x="38" y="731">nested spans, cost at ingest</text>
+
+    <rect class="box" x="230" y="694" width="176" height="56" rx="8"/>
+    <text class="t body" x="244" y="714">2 · Observe</text>
+    <text class="m lbl" x="244" y="731">filters, tree, dashboard</text>
+
+    <rect class="box" x="436" y="694" width="176" height="56" rx="8"/>
+    <text class="t body" x="450" y="714">3 · Review</text>
+    <text class="m lbl" x="450" y="731">thumbs + corrected answer</text>
+
+    <rect class="box" x="642" y="694" width="176" height="56" rx="8"/>
+    <text class="t body" x="656" y="714">4 · Promote</text>
+    <text class="m lbl" x="656" y="731">trace → dataset record</text>
+
+    <rect class="box" x="848" y="694" width="176" height="56" rx="8"/>
+    <text class="t body" x="862" y="714">5 · Evaluate</text>
+    <text class="m lbl" x="862" y="731">deterministic + judges</text>
+
+    <rect class="box" x="1054" y="694" width="162" height="56" rx="8"/>
+    <text class="t body" x="1068" y="714">6 · Compare</text>
+    <text class="m lbl" x="1068" y="731">Δ vs baseline</text>
+
+    <line class="arrow" x1="200" y1="722" x2="226" y2="722" marker-end="url(#ah)"/>
+    <line class="arrow" x1="406" y1="722" x2="432" y2="722" marker-end="url(#ah)"/>
+    <line class="arrow" x1="612" y1="722" x2="638" y2="722" marker-end="url(#ah)"/>
+    <line class="arrow" x1="818" y1="722" x2="844" y2="722" marker-end="url(#ah)"/>
+    <line class="arrow" x1="1024" y1="722" x2="1050" y2="722" marker-end="url(#ah)"/>
+  </g>
+  <text class="m lbl" x="24" y="772">production failures become regression tests — the loop, not the traces, is the product</text>
+</svg>
+
+<footer>
+  Ports: API <code>:8000</code> · UI <code>:5173</code>. Storage: one SQLite file. Eval execution: Python subprocess
+  returning over the public API. Provider: OpenRouter, model pinned to <code>openrouter/free</code>.
+  Full detail and gap analysis: <code>docs/ARCHITECTURE.md</code>.
+</footer>
+
+</body>
+</html>
