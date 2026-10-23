@@ -394,7 +394,7 @@ cd server-go && go test ./... -count=1
 | `TestOTLPJSONIngestAndEmptyBatch` | JSON export works, and the hex→base64 conversion keeps the exporter's trace id; empty batch returns 200 and creates no project |
 | `TestOTLPRejectsGarbage` | malformed protobuf/JSON → `400`, not a panic or a 500 |
 
-Result: `ok evalforge` (11 tests: 4 OTLP, 6 auth, 1 shutdown).
+Result: `ok evalforge` (11 tests: 3 OTLP, 8 auth).
 
 ### 9.2 Contract smoke — the whole API on a private server
 
@@ -491,7 +491,7 @@ dashboard requests: 36 p95: 3515 isError: False
 
 ```bash
 python scripts/auth_test.py    # 44 checks on a private server, AUTH_MODE=required
-(cd server-go && go test ./...)   # 11 Go tests, including 6 auth ones
+(cd server-go && go test ./...)   # 11 Go tests, including 8 auth ones
 ```
 
 The script boots a second private server with `AUTH_MODE=required` and drives the flow a remote MCP

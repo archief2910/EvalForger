@@ -191,7 +191,7 @@ Expired codes and tokens are scrubbed hourly.
 ## Scripts
 ```bash
 python scripts/smoke_api.py     # 31-check contract run on a private server + temp DB (demo data untouched)
-python scripts/auth_test.py     # 24 checks: keys, scopes, PKCE flow, refresh rotation, revocation, MCP auth
+python scripts/auth_test.py     # 44 checks: keys, scopes, PKCE flow, refresh rotation, revocation, MCP auth
 python scripts/fault_test.py    # 16 checks: crash mid-eval, hung worker, worker crash + retry
 python scripts/load_test.py     # concurrent ingest/query benchmark with integrity assertions
 python scripts/mcp_test.py      # 23 MCP checks: handshake, tools, reads, writes, eval, errors
