@@ -53,7 +53,7 @@ def server_binary():
         p = os.path.join(ROOT, "server-go", name)
         if os.path.exists(p):
             return p
-    raise SystemExit("build the server first: (cd server-go && go build -o evalforge.exe .)")
+    raise SystemExit("build the server first: (cd server-go && go build -o evalforge.exe ./cmd/server)")
 
 
 def hard_kill(proc):

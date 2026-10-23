@@ -1,4 +1,4 @@
-package main
+package api
 
 // Tests for the OTLP/HTTP ingest contract. These drive the handler through
 // httptest with a real (temporary) SQLite database, so they assert what an
@@ -9,7 +9,6 @@ import (
 	"encoding/hex"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"testing"
 
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
@@ -19,15 +18,6 @@ import (
 	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 )
-
-func testServer(t *testing.T) {
-	t.Helper()
-	os.Setenv("DATA_DIR", t.TempDir())
-	if err := openDB(); err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-}
 
 func str(s string) *commonpb.AnyValue {
 	return &commonpb.AnyValue{Value: &commonpb.AnyValue_StringValue{StringValue: s}}
@@ -75,7 +65,7 @@ func sampleRequest(traceID, rootID, childID []byte) *collectortrace.ExportTraceS
 	}
 }
 
-func postOTLP(t *testing.T, body []byte, contentType string, headers map[string]string) *httptest.ResponseRecorder {
+func postOTLP(t *testing.T, s *Server, body []byte, contentType string, headers map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/v1/traces", bytes.NewReader(body))
 	req.Header.Set("Content-Type", contentType)
@@ -83,12 +73,13 @@ func postOTLP(t *testing.T, body []byte, contentType string, headers map[string]
 		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
-	handleOTLPTraces(rec, req, "")
+	s.handleOTLPTraces(rec, req, "")
 	return rec
 }
 
 func TestOTLPProtobufIngest(t *testing.T) {
-	testServer(t)
+	s, db := testServer(t)
+	_ = s
 	traceID := bytes.Repeat([]byte{0x11}, 16)
 	rootID := bytes.Repeat([]byte{0x01}, 8)
 	childID := bytes.Repeat([]byte{0x02}, 8)
@@ -97,7 +88,7 @@ func TestOTLPProtobufIngest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := postOTLP(t, body, "application/x-protobuf", map[string]string{"project-name": "otlp-svc"})
+	rec := postOTLP(t, s, body, "application/x-protobuf", map[string]string{"project-name": "otlp-svc"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -167,7 +158,7 @@ func TestOTLPProtobufIngest(t *testing.T) {
 	}
 
 	// Retried batch: same span ids must not duplicate.
-	rec = postOTLP(t, body, "application/x-protobuf", map[string]string{"project-name": "otlp-svc"})
+	rec = postOTLP(t, s, body, "application/x-protobuf", map[string]string{"project-name": "otlp-svc"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("retry status = %d", rec.Code)
 	}
@@ -180,13 +171,14 @@ func TestOTLPProtobufIngest(t *testing.T) {
 }
 
 func TestOTLPJSONIngestAndEmptyBatch(t *testing.T) {
-	testServer(t)
+	s, db := testServer(t)
+	_ = s
 	traceID := bytes.Repeat([]byte{0x22}, 16)
 	body, err := protojson.Marshal(sampleRequest(traceID, bytes.Repeat([]byte{0x03}, 8), bytes.Repeat([]byte{0x04}, 8)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	rec := postOTLP(t, body, "application/json", map[string]string{"project-name": "json-svc"})
+	rec := postOTLP(t, s, body, "application/json", map[string]string{"project-name": "json-svc"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
 	}
@@ -205,7 +197,7 @@ func TestOTLPJSONIngestAndEmptyBatch(t *testing.T) {
 
 	// Empty export: valid OTLP, 200, and no project should be created for it.
 	empty := []byte(`{"resourceSpans":[]}`)
-	rec = postOTLP(t, empty, "application/json", map[string]string{"project-name": "ghost"})
+	rec = postOTLP(t, s, empty, "application/json", map[string]string{"project-name": "ghost"})
 	if rec.Code != http.StatusOK {
 		t.Fatalf("empty status = %d", rec.Code)
 	}
@@ -219,12 +211,13 @@ func TestOTLPJSONIngestAndEmptyBatch(t *testing.T) {
 }
 
 func TestOTLPRejectsGarbage(t *testing.T) {
-	testServer(t)
-	rec := postOTLP(t, []byte{0xff, 0xff, 0xff}, "application/x-protobuf", nil)
+	s, _ := testServer(t)
+	_ = s
+	rec := postOTLP(t, s, []byte{0xff, 0xff, 0xff}, "application/x-protobuf", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", rec.Code)
 	}
-	rec = postOTLP(t, []byte(`{"nope":`), "application/json", nil)
+	rec = postOTLP(t, s, []byte(`{"nope":`), "application/json", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("json status = %d, want 400", rec.Code)
 	}

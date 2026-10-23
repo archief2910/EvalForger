@@ -358,12 +358,17 @@ deliberately simple on storage and enterprise concerns.
 
 | Concern | File |
 |---|---|
-| Routing, handlers, schema, worker dispatch | [server-go/main.go](../server-go/main.go) |
-| Durable job queue (claim/lease/reaper) | [server-go/jobs.go](../server-go/jobs.go) |
-| OTLP/HTTP ingest + attribute mapping | [server-go/otlp.go](../server-go/otlp.go) |
-| Request id, access log, panic recovery, CORS | [server-go/middleware.go](../server-go/middleware.go) |
-| MCP server (stdio + Streamable HTTP, 11 tools) | [server-go/mcp.go](../server-go/mcp.go), [server-go/mcp_http.go](../server-go/mcp_http.go) |
-| API keys + OAuth 2.1 authorization server | [server-go/auth.go](../server-go/auth.go) |
+| Process wiring: flags, config, migrate, serve, graceful shutdown | [server-go/cmd/server/main.go](../server-go/cmd/server/main.go) |
+| HTTP handlers, routing and response shapes | [server-go/internal/api/handlers.go](../server-go/internal/api/handlers.go), [router.go](../server-go/internal/api/router.go) |
+| Dataset snapshots + prompt pinning | [server-go/internal/api/versioning.go](../server-go/internal/api/versioning.go) |
+| Durable job queue (claim/lease/reaper) | [server-go/internal/queue/queue.go](../server-go/internal/queue/queue.go) |
+| OTLP/HTTP ingest + attribute mapping | [server-go/internal/api/otlp.go](../server-go/internal/api/otlp.go) |
+| Request id, access log, panic recovery, CORS | [server-go/internal/api/middleware.go](../server-go/internal/api/middleware.go) |
+| MCP server (stdio + Streamable HTTP, 11 tools) | [server-go/internal/api/mcp.go](../server-go/internal/api/mcp.go), [mcp_http.go](../server-go/internal/api/mcp_http.go) |
+| API keys + OAuth 2.1 authorization server | [server-go/internal/api/auth.go](../server-go/internal/api/auth.go) |
+| Schema and forward-only migrations | [server-go/internal/database](../server-go/internal/database) |
+| Typed runtime configuration | [server-go/internal/config/config.go](../server-go/internal/config/config.go) |
+| Worker subprocess boundary | [server-go/internal/worker/client.go](../server-go/internal/worker/client.go) |
 | Scorers, judges, prompt rendering, job loop | [worker-py/worker.py](../worker-py/worker.py) |
 | Demo data (talks only to the HTTP API) | [worker-py/seed.py](../worker-py/seed.py) |
 | Batching + nesting reference client | [sdk/sample_client.py](../sdk/sample_client.py) |

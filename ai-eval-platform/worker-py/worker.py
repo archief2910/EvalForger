@@ -11,6 +11,9 @@ Credentials are read from env only (loaded by the server from .env); never print
 import argparse, concurrent.futures, json, os, re, sys, time, urllib.request, urllib.error
 
 GO = os.environ.get("GO_SERVER", "http://localhost:8000")
+# The server generates this per boot and passes it only to its own child
+# processes, so the worker can call back even when AUTH_MODE=required.
+INTERNAL_TOKEN = os.environ.get("EVALFORGE_INTERNAL_TOKEN", "")
 
 
 def log(msg):
@@ -19,14 +22,22 @@ def log(msg):
 API = GO + "/api/v1"
 
 
+def _headers(extra=None):
+    h = dict(extra or {})
+    if INTERNAL_TOKEN:
+        h["X-Internal-Token"] = INTERNAL_TOKEN
+    return h
+
+
 def _get(path):
-    with urllib.request.urlopen(API + path, timeout=15) as r:
+    req = urllib.request.Request(API + path, headers=_headers())
+    with urllib.request.urlopen(req, timeout=15) as r:
         return json.loads(r.read().decode())
 
 
 def _post(path, payload):
     req = urllib.request.Request(API + path, data=json.dumps(payload).encode(),
-                                 headers={"Content-Type": "application/json"}, method="POST")
+                                 headers=_headers({"Content-Type": "application/json"}), method="POST")
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())
 
@@ -277,11 +288,14 @@ def _simulate_output(record_input, expected, salt=""):
     return f"Computed answer for {text}: variant {h}"
 
 
-def generate_task(record_input, task_mode, salt):
+def generate_task(record_input, task_mode, salt, prompt_template=None):
     """Returns (output, error, mode) where mode is llm | simulated_fallback."""
     if provider_available():
-        msgs = render_prompt({"messages": [
-            {"role": "user", "content": "Answer this support question accurately and concisely:\n{{input}}"}]}, record_input)
+        if prompt_template is not None:
+            msgs = render_prompt(prompt_template, record_input)
+        else:
+            msgs = render_prompt({"messages": [
+                {"role": "user", "content": "Answer this support question accurately and concisely:\n{{input}}"}]}, record_input)
         resp = call_llm(msgs)
         content = (resp or {}).get("content")
         if content:
@@ -300,16 +314,30 @@ def main():
     ap.add_argument("--experiment-id", required=True)
     ap.add_argument("--project-id", required=True)
     ap.add_argument("--dataset-id", required=True)
+    ap.add_argument("--dataset-version-id", default="")
+    ap.add_argument("--prompt-version-id", default="")
     ap.add_argument("--experiment-name")
     ap.add_argument("--baseline-id", default="")
     ap.add_argument("--scorers", default="exact_match,factuality_judge")
     args = ap.parse_args()
 
     try:
-        ds = _get(f"/datasets/{args.dataset_id}")
+        # An experiment pins an immutable snapshot, so a concurrent dataset edit
+        # cannot change what this run evaluates. Older jobs without a version id
+        # fall back to the live dataset.
+        if args.dataset_version_id:
+            ds = _get(f"/dataset_versions/{args.dataset_version_id}")
+        else:
+            ds = _get(f"/datasets/{args.dataset_id}")
         records = ds["records"]
         scorer_names = [s.strip() for s in args.scorers.split(",") if s.strip()]
         builtin = {b["name"]: b["kind"] for b in _get("/scorers")}
+
+        prompt_template = None
+        if args.prompt_version_id:
+            prompt = _get(f"/prompts/{args.prompt_version_id}")
+            prompt_template = prompt.get("template")
+            log(f"prompt name={prompt.get('name')} version={prompt.get('version')}")
 
         # baseline runs for comparison
         base_by_input = {}
@@ -331,7 +359,8 @@ def main():
             sinput = rec.get("input")
             expected = rec.get("expected")
             t0 = time.time() * 1000
-            out, err, out_mode = generate_task(sinput, "auto", salt=args.experiment_id + str(i))
+            out, err, out_mode = generate_task(sinput, "auto", salt=args.experiment_id + str(i),
+                                               prompt_template=prompt_template)
             latency = int(time.time() * 1000 - t0)
             scores = {}
             for sn in scorer_names:

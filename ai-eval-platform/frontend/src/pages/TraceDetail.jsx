@@ -84,7 +84,9 @@ export default function TraceDetail() {
                     {sel.model && <span className="mono" style={{ color: "var(--muted)" }}>{sel.model}</span>}
                   </div>
                   <div className="kv">
-                    {(sel.prompt_tokens || sel.completion_tokens) ? `${fmt.num(sel.prompt_tokens)} in · ${fmt.num(sel.completion_tokens)} out · ${fmt.usd(sel.cost_usd)}` : fmt.ms(sel.latency_ms)}
+                    {(sel.prompt_tokens || sel.completion_tokens)
+                      ? `${fmt.num(sel.prompt_tokens)} in · ${fmt.num(sel.completion_tokens)} out · ${fmt.usd(sel.cost_usd)}${sel.token_source === "estimated" ? " (est.)" : ""}`
+                      : fmt.ms(sel.latency_ms)}
                   </div>
                 </div>
                 {sel.error && <pre className="json" style={{ borderColor: "rgba(255,107,107,.5)" }}>{JSON.stringify(sel.error, null, 2)}</pre>}

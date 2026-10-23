@@ -59,20 +59,32 @@ export default function ExperimentDetail() {
   const scoreNames = Object.keys(s.scores || {});
   const rerun = async () => {
     const dsid = e.dataset_id;
-    const dataset = await api.get(`/api/v1/datasets/${dsid}`);
     const { experiment_id } = await api.post(
       `/api/v1/projects/${e.project_id}/evaluations`,
-      { dataset_id: dsid, experiment_name: `${e.name} (rerun)`, scorer_names: Object.keys(s.scores || ["exact_match"]), baseline_experiment_id: e.baseline_experiment_id }
+      {
+        dataset_id: dsid,
+        experiment_name: `${e.name} (rerun)`,
+        scorer_names: Object.keys(s.scores || ["exact_match"]),
+        baseline_experiment_id: e.baseline_experiment_id,
+        // Pin exactly what this experiment saw, not whatever the dataset
+        // happens to contain now.
+        ...(e.dataset_version_id ? { dataset_version_id: e.dataset_version_id } : {}),
+        ...(e.prompt_version_id ? { prompt_version_id: e.prompt_version_id } : {}),
+      }
     );
-    // reload happens through nav below
     window.location.assign(`/projects/${e.project_id}/experiments/${experiment_id}`);
   };
   return (
     <div>
       <div className="row"><Link to={`/projects/${pid}/experiments`} style={{ color: "var(--muted)" }}>← Experiments</Link></div>
-      <h1>{e.name} <span className={"pill " + (e.status === "completed" ? "ok" : e.status === "failed" ? "error" : "")}>{e.status}</span></h1>
+      <div className="row" style={{ justifyContent: "space-between" }}>
+        <h1>{e.name} <span className={"pill " + (e.status === "completed" ? "ok" : e.status === "failed" ? "error" : "")}>{e.status}</span></h1>
+        <button className="ghost small" onClick={rerun} title="Run the same dataset snapshot and prompt version">↻ Rerun pinned</button>
+      </div>
       <p className="sub">
         Dataset: {e.dataset_name || (e.dataset_id || "").slice(0, 8) + "…"}
+        {e.dataset_version_seq ? <> · pinned v{e.dataset_version_seq} {e.dataset_version_hash && <span className="mono" title={e.dataset_version_hash}>({e.dataset_version_hash.slice(0, 8)})</span>}</> : null}
+        {e.prompt_name ? <> · prompt {e.prompt_name} v{e.prompt_version}</> : null}
         {e.baseline_experiment_id && (
           <> · baseline: {baseline ? baseline.name : (e.baseline_experiment_id || "").slice(0, 8) + "…"}</>
         )}

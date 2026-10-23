@@ -11,6 +11,8 @@ export default function DatasetDetail() {
   const [baseline, setBaseline] = useState("");
   const [scorers, setScorers] = useState([]);
   const [selScorers, setSelScorers] = useState(["exact_match", "factuality_judge"]);
+  const [prompts, setPrompts] = useState([]);
+  const [promptID, setPromptID] = useState("");
   const [toast, setToast] = useState(null);
   const flash = (m) => { setToast(m); setTimeout(() => setToast(null), 3200); };
 
@@ -21,6 +23,7 @@ export default function DatasetDetail() {
   useEffect(() => {
     api.get(`/api/v1/projects/${pid}/experiments`).then(setExperiments).catch(() => {});
     api.get(`/api/v1/scorers?project_id=${pid}`).then((s) => setScorers(s)).catch(() => {});
+    api.get(`/api/v1/projects/${pid}/prompts`).then((p) => setPrompts(p)).catch(() => {});
   }, [pid]);
 
   if (!d) return <div className="empty">Loading…</div>;
@@ -34,11 +37,13 @@ export default function DatasetDetail() {
     load();
   };
   const runEval = async () => {
+    const prompt = prompts.find((p) => p.id === promptID);
     const { experiment_id } = await api.post(`/api/v1/projects/${pid}/evaluations`, {
       dataset_id: dsid,
       experiment_name: `${d.name} ${new Date().toLocaleTimeString()}`,
       scorer_names: selScorers,
       baseline_experiment_id: baseline || null,
+      ...(prompt ? { prompt_name: prompt.name, prompt_version: prompt.version } : {}),
     });
     flash("Evaluation running…");
     nav(`/projects/${pid}/experiments/${experiment_id}`);
@@ -47,7 +52,10 @@ export default function DatasetDetail() {
     <div>
       <div className="row"><Link to={`/projects/${pid}/datasets`} style={{ color: "var(--muted)" }}>← Datasets</Link></div>
       <h1>{d.name} <span className="pill">v{d.version}</span></h1>
-      <p className="sub">{d.description} {d.project_name && `· project: ${d.project_name}`} · {d.records.length} records</p>
+      <p className="sub">
+        {d.description} {d.project_name && `· project: ${d.project_name}`} · {d.records.length} records
+        {d.latest_version_hash && <> · snapshot <span className="mono" title={d.latest_version_hash}>{d.latest_version_hash.slice(0, 8)}</span></>}
+      </p>
 
       <div className="card">
         <b>Records</b>
@@ -101,6 +109,15 @@ export default function DatasetDetail() {
             <option value="">— no baseline —</option>
             {experiments.map((e) => <option key={e.id} value={e.id}>{e.name}</option>)}
           </select>
+          {prompts.length > 0 && (
+            <>
+              <div style={{ color: "var(--muted)", fontSize: 12, marginTop: 10 }}>Prompt template (pinned to this run):</div>
+              <select style={{ width: "100%", marginTop: 6 }} value={promptID} onChange={(e) => setPromptID(e.target.value)}>
+                <option value="">— default task prompt —</option>
+                {prompts.map((p) => <option key={p.id} value={p.id}>{p.name} v{p.version}</option>)}
+              </select>
+            </>
+          )}
           <button style={{ marginTop: 10 }} onClick={runEval}>▶ Run evaluation</button>
         </div>
       </div>

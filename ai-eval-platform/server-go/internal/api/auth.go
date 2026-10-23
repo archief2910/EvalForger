@@ -1,4 +1,4 @@
-package main
+package api
 
 // Authentication and authorization.
 //
@@ -38,87 +38,17 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
+
+	"evalforge/internal/model"
 	"strings"
 	"time"
 )
 
 const (
-	authSchema = `
-CREATE TABLE IF NOT EXISTS api_keys (
-  id TEXT PRIMARY KEY,
-  name TEXT NOT NULL,
-  prefix TEXT NOT NULL,
-  key_hash TEXT NOT NULL UNIQUE,
-  owner TEXT NOT NULL DEFAULT '',
-  scopes TEXT NOT NULL DEFAULT 'read,write',
-  project_id TEXT,
-  created_at TEXT NOT NULL,
-  last_used_at TEXT,
-  expires_at TEXT,
-  revoked_at TEXT
-);
-CREATE TABLE IF NOT EXISTS oauth_clients (
-  client_id TEXT PRIMARY KEY,
-  client_secret_hash TEXT,
-  client_name TEXT NOT NULL DEFAULT '',
-  redirect_uris TEXT NOT NULL,
-  grant_types TEXT NOT NULL DEFAULT 'authorization_code',
-  scope TEXT,
-  token_endpoint_auth_method TEXT NOT NULL DEFAULT 'none',
-  created_at TEXT NOT NULL
-);
-CREATE TABLE IF NOT EXISTS oauth_codes (
-  code_hash TEXT PRIMARY KEY,
-  client_id TEXT NOT NULL,
-  key_id TEXT NOT NULL,
-  owner TEXT NOT NULL DEFAULT '',
-  project_id TEXT,
-  redirect_uri TEXT NOT NULL,
-  scope TEXT NOT NULL DEFAULT '',
-  code_challenge TEXT NOT NULL,
-  code_challenge_method TEXT NOT NULL DEFAULT 'S256',
-  resource TEXT,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  used_at TEXT
-);
-CREATE TABLE IF NOT EXISTS oauth_tokens (
-  token_hash TEXT PRIMARY KEY,
-  kind TEXT NOT NULL,
-  client_id TEXT NOT NULL,
-  key_id TEXT NOT NULL,
-  owner TEXT NOT NULL DEFAULT '',
-  project_id TEXT,
-  scope TEXT NOT NULL DEFAULT '',
-  resource TEXT,
-  created_at TEXT NOT NULL,
-  expires_at TEXT NOT NULL,
-  revoked_at TEXT,
-  rotated_from TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_oauth_tokens_key ON oauth_tokens(key_id);
-`
-
 	accessTokenTTL  = time.Hour
 	refreshTokenTTL = 30 * 24 * time.Hour
 	authCodeTTL     = 5 * time.Minute
 )
-
-// authEnabled is true when the deployment requires credentials.
-func authEnabled() bool {
-	return strings.EqualFold(os.Getenv("AUTH_MODE"), "required")
-}
-
-// issuer is the public origin used in discovery documents and token audiences.
-// PUBLIC_BASE_URL exists because a proxied deployment is not reachable at the
-// address the process listens on.
-func issuer() string {
-	if v := strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"); v != "" {
-		return v
-	}
-	return selfBaseURL
-}
 
 // ---------- principal ----------
 
@@ -143,6 +73,14 @@ func (p *principal) can(scope string) bool {
 }
 
 func (p *principal) hasAdmin() bool { return p != nil && p.Scopes["admin"] }
+
+// allowProject guards handlers that address a resource by id instead of by
+// project path. A project-scoped credential must not reach another project's
+// dataset, prompt or experiment just because it knows the id.
+func allowProject(r *http.Request, projectID string) bool {
+	p := principalFrom(r.Context())
+	return p == nil || p.ProjectID == "" || p.ProjectID == projectID
+}
 
 type principalKeyType string
 
@@ -245,7 +183,7 @@ type apiKey struct {
 	RevokedAt  string   `json:"revoked_at,omitempty"`
 }
 
-func insertAPIKey(name, owner string, scopes map[string]bool, projectID string, ttl time.Duration) (string, apiKey, error) {
+func (s *Server) insertAPIKey(name, owner string, scopes map[string]bool, projectID string, ttl time.Duration) (string, apiKey, error) {
 	raw := "efk_" + randToken(32)
 	prefix := raw[:12]
 	id := "key_" + randToken(9)
@@ -254,17 +192,17 @@ func insertAPIKey(name, owner string, scopes map[string]bool, projectID string, 
 		expires = time.Now().UTC().Add(ttl).Format(time.RFC3339)
 	}
 	sc := joinScopes(scopes)
-	_, err := db.Exec(
+	_, err := s.DB.Exec(
 		`INSERT INTO api_keys(id,name,prefix,key_hash,owner,scopes,project_id,created_at,expires_at)
 		 VALUES(?,?,?,?,?,?,?,?,?)`,
-		id, name, prefix, hashToken(raw), owner, sc, nullIfEmpty(projectID), nowUTC(), nullIfEmpty(expires))
+		id, name, prefix, hashToken(raw), owner, sc, nullIfEmpty(projectID), model.NowUTC(), nullIfEmpty(expires))
 	if err != nil {
 		return "", apiKey{}, err
 	}
 	return raw, apiKey{
 		ID: id, Name: name, Prefix: prefix, Owner: owner,
 		Scopes: strings.Fields(sc), ProjectID: projectID,
-		CreatedAt: nowUTC(), ExpiresAt: expires,
+		CreatedAt: model.NowUTC(), ExpiresAt: expires,
 	}, nil
 }
 
@@ -277,7 +215,7 @@ func nullIfEmpty(s string) interface{} {
 
 // lookupAPIKey resolves a bearer/API-key string to a principal. The hash is the
 // primary key lookup, so a leaked database still does not yield usable keys.
-func lookupAPIKey(raw string) (*principal, error) {
+func (s *Server) lookupAPIKey(raw string) (*principal, error) {
 	raw = strings.TrimSpace(raw)
 	if raw == "" {
 		return nil, errors.New("empty credential")
@@ -286,7 +224,7 @@ func lookupAPIKey(raw string) (*principal, error) {
 		id, owner, scopes, createdAt  string
 		projectID, expiresAt, revoked sql.NullString
 	)
-	err := db.QueryRow(
+	err := s.DB.QueryRow(
 		`SELECT id,owner,scopes,project_id,created_at,expires_at,revoked_at
 		   FROM api_keys WHERE key_hash=?`, hashToken(raw)).
 		Scan(&id, &owner, &scopes, &projectID, &createdAt, &expiresAt, &revoked)
@@ -303,33 +241,33 @@ func lookupAPIKey(raw string) (*principal, error) {
 		return nil, errors.New("API key expired")
 	}
 	// Throttled last-used stamp: one write per minute per key, not per request.
-	_, _ = db.Exec(
+	_, _ = s.DB.Exec(
 		`UPDATE api_keys SET last_used_at=? WHERE id=? AND (last_used_at IS NULL OR last_used_at < ?)`,
-		nowUTC(), id, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano))
+		model.NowUTC(), id, time.Now().UTC().Add(-time.Minute).Format(time.RFC3339Nano))
 	return &principal{
 		Kind: "api_key", KeyID: id, Owner: owner,
 		ProjectID: projectID.String, Scopes: splitScopes(scopes),
 	}, nil
 }
 
-func revokeAPIKey(id string) error {
-	_, err := db.Exec(`UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, nowUTC(), id)
+func (s *Server) revokeAPIKey(id string) error {
+	_, err := s.DB.Exec(`UPDATE api_keys SET revoked_at=? WHERE id=? AND revoked_at IS NULL`, model.NowUTC(), id)
 	if err != nil {
 		return err
 	}
-	_, err = db.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE key_id=? AND revoked_at IS NULL`, nowUTC(), id)
+	_, err = s.DB.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE key_id=? AND revoked_at IS NULL`, model.NowUTC(), id)
 	return err
 }
 
 // ---------- OAuth access tokens ----------
 
-func lookupAccessToken(raw string) (*principal, error) {
+func (s *Server) lookupAccessToken(raw string) (*principal, error) {
 	var (
 		keyID, owner, scopes, clientID, expiresAt string
 		projectID, revoked                        sql.NullString
 	)
 	h := hashToken(raw)
-	err := db.QueryRow(
+	err := s.DB.QueryRow(
 		`SELECT key_id,owner,scope,client_id,expires_at,project_id,revoked_at
 		   FROM oauth_tokens WHERE token_hash=? AND kind='access'`, h).
 		Scan(&keyID, &owner, &scopes, &clientID, &expiresAt, &projectID, &revoked)
@@ -346,7 +284,7 @@ func lookupAccessToken(raw string) (*principal, error) {
 		return nil, errors.New("access token expired")
 	}
 	// A key revoked after the token was issued must also kill the token.
-	if _, err := lookupAPIKeyByID(keyID); err != nil {
+	if _, err := s.lookupAPIKeyByID(keyID); err != nil {
 		return nil, err
 	}
 	return &principal{
@@ -355,10 +293,10 @@ func lookupAccessToken(raw string) (*principal, error) {
 	}, nil
 }
 
-func lookupAPIKeyByID(id string) (string, error) {
+func (s *Server) lookupAPIKeyByID(id string) (string, error) {
 	var owner string
 	var revoked sql.NullString
-	err := db.QueryRow(`SELECT owner,revoked_at FROM api_keys WHERE id=?`, id).Scan(&owner, &revoked)
+	err := s.DB.QueryRow(`SELECT owner,revoked_at FROM api_keys WHERE id=?`, id).Scan(&owner, &revoked)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", errors.New("credential no longer exists")
 	}
@@ -371,11 +309,11 @@ func lookupAPIKeyByID(id string) (string, error) {
 	return owner, nil
 }
 
-func issueTokenPair(clientID, keyID, owner, projectID, scope, resource, rotatedFrom string) (map[string]interface{}, error) {
+func (s *Server) issueTokenPair(clientID, keyID, owner, projectID, scope, resource, rotatedFrom string) (map[string]interface{}, error) {
 	access := "efa_" + randToken(32)
 	refresh := "efr_" + randToken(40)
 	now := time.Now().UTC()
-	tx, err := db.Begin()
+	tx, err := s.DB.Begin()
 	if err != nil {
 		return nil, err
 	}
@@ -466,7 +404,7 @@ func bearerToken(r *http.Request) string {
 // authenticate is the single gate every route passes through. It never
 // distinguishes "unknown key" from "revoked key" in the response, so it cannot
 // be used to enumerate credentials.
-func authenticate(next http.Handler) http.Handler {
+func (s *Server) authenticate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if publicPath(r.URL.Path) {
 			next.ServeHTTP(w, r)
@@ -477,24 +415,37 @@ func authenticate(next http.Handler) http.Handler {
 			p   *principal
 			err error
 		)
-		if tok := bearerToken(r); tok != "" {
+		// The evaluation worker is a child process of this server. It proves
+		// itself with a boot-scoped token rather than a database credential, so
+		// no long-lived secret has to be provisioned for AUTH_MODE=required.
+		if tok := r.Header.Get("X-Internal-Token"); tok != "" {
+			if subtle.ConstantTimeCompare([]byte(tok), []byte(s.internalToken)) != 1 {
+				s.challengeRequest(w, r, "invalid internal token")
+				return
+			}
+			p = &principal{
+				Kind:   "internal",
+				Owner:  "eval-worker",
+				Scopes: map[string]bool{"read": true, "write": true, "admin": true},
+			}
+		} else if tok := bearerToken(r); tok != "" {
 			if strings.HasPrefix(tok, "efa_") {
-				p, err = lookupAccessToken(tok)
+				p, err = s.lookupAccessToken(tok)
 			} else {
-				p, err = lookupAPIKey(tok)
+				p, err = s.lookupAPIKey(tok)
 			}
 		}
 
 		if err != nil {
-			challengeRequest(w, r, err.Error())
+			s.challengeRequest(w, r, err.Error())
 			return
 		}
 		if p == nil {
-			if !authEnabled() || bootstrapWindow(r) {
+			if !s.cfg.AuthRequired() || s.bootstrapWindow(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
-			challengeRequest(w, r, "authentication required")
+			s.challengeRequest(w, r, "authentication required")
 			return
 		}
 
@@ -521,16 +472,16 @@ func authenticate(next http.Handler) http.Handler {
 // bootstrapWindow lets the very first key be minted on a fresh, auth-required
 // deployment. Without it every request would need a credential that does not
 // exist yet. It applies only to key creation while zero keys are registered.
-func bootstrapWindow(r *http.Request) bool {
+func (s *Server) bootstrapWindow(r *http.Request) bool {
 	if r.Method != http.MethodPost || strings.TrimRight(r.URL.Path, "/") != "/api/v1/keys" {
 		return false
 	}
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&n); err != nil {
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM api_keys`).Scan(&n); err != nil {
 		return false
 	}
 	if n == 0 {
-		logf("bootstrap allowed: creating the first API key without credentials")
+		s.logf("bootstrap allowed: creating the first API key without credentials")
 		return true
 	}
 	return false
@@ -549,10 +500,10 @@ func drainBody(r *http.Request) {
 	_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, 1<<20))
 }
 
-func challengeRequest(w http.ResponseWriter, r *http.Request, reason string) {
+func (s *Server) challengeRequest(w http.ResponseWriter, r *http.Request, reason string) {
 	drainBody(r)
 	w.Header().Set("WWW-Authenticate",
-		fmt.Sprintf(`Bearer realm="evalforge", resource_metadata="%s/.well-known/oauth-protected-resource"`, issuer()))
+		fmt.Sprintf(`Bearer realm="evalforge", resource_metadata="%s/.well-known/oauth-protected-resource"`, s.issuer()))
 	if strings.HasPrefix(r.URL.Path, "/mcp") || strings.HasPrefix(r.URL.Path, "/api/") {
 		w.Header().Set("Cache-Control", "no-store")
 	}
@@ -561,7 +512,7 @@ func challengeRequest(w http.ResponseWriter, r *http.Request, reason string) {
 
 // ---------- whoami ----------
 
-func handleWhoAmI(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 	p := principalFrom(r.Context())
 	if p == nil {
 		writeJSON(w, 200, map[string]interface{}{
@@ -579,10 +530,10 @@ func handleWhoAmI(w http.ResponseWriter, r *http.Request) {
 
 // ---------- API key endpoints ----------
 
-func handleKeys(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleKeys(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
-		rows, err := db.Query(`SELECT id,name,prefix,owner,scopes,project_id,created_at,last_used_at,expires_at,revoked_at
+		rows, err := s.DB.Query(`SELECT id,name,prefix,owner,scopes,project_id,created_at,last_used_at,expires_at,revoked_at
 		                         FROM api_keys ORDER BY created_at DESC`)
 		if err != nil {
 			errJSON(w, 500, err.Error())
@@ -628,23 +579,23 @@ func handleKeys(w http.ResponseWriter, r *http.Request) {
 		}
 		// A bootstrap key must be able to administer the deployment, otherwise
 		// the first key could lock everybody out of key management.
-		if principalFrom(r.Context()) == nil && authEnabled() {
+		if principalFrom(r.Context()) == nil && s.cfg.AuthRequired() {
 			scopes["admin"] = true
 		}
 		if body.ProjectID != "" {
 			var exists int
-			if err := db.QueryRow(`SELECT COUNT(*) FROM projects WHERE id=?`, body.ProjectID).Scan(&exists); err != nil || exists == 0 {
+			if err := s.DB.QueryRow(`SELECT COUNT(*) FROM projects WHERE id=?`, body.ProjectID).Scan(&exists); err != nil || exists == 0 {
 				errJSON(w, 400, "project not found: "+body.ProjectID)
 				return
 			}
 		}
 		ttl := time.Duration(body.ExpiresIn) * 24 * time.Hour
-		raw, key, err := insertAPIKey(body.Name, body.Owner, scopes, body.ProjectID, ttl)
+		raw, key, err := s.insertAPIKey(body.Name, body.Owner, scopes, body.ProjectID, ttl)
 		if err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		logf("api key created", "key_id", key.ID, "owner", key.Owner, "scopes", strings.Join(key.Scopes, ","))
+		s.logf("api key created", "key_id", key.ID, "owner", key.Owner, "scopes", strings.Join(key.Scopes, ","))
 		w.Header().Set("Cache-Control", "no-store")
 		writeJSON(w, 201, map[string]interface{}{
 			"id": key.ID, "name": key.Name, "owner": key.Owner, "scopes": key.Scopes,
@@ -660,11 +611,11 @@ func handleKeys(w http.ResponseWriter, r *http.Request) {
 			errJSON(w, 400, "key id required: DELETE /api/v1/keys/{id}")
 			return
 		}
-		if err := revokeAPIKey(id); err != nil {
+		if err := s.revokeAPIKey(id); err != nil {
 			errJSON(w, 500, err.Error())
 			return
 		}
-		logf("api key revoked", "key_id", id)
+		s.logf("api key revoked", "key_id", id)
 		writeJSON(w, 200, map[string]string{"ok": "revoked", "id": id})
 	default:
 		errJSON(w, 405, "method not allowed")
@@ -673,8 +624,8 @@ func handleKeys(w http.ResponseWriter, r *http.Request) {
 
 // ---------- discovery ----------
 
-func handleOAuthMetadata(w http.ResponseWriter, r *http.Request) {
-	base := issuer()
+func (s *Server) handleOAuthMetadata(w http.ResponseWriter, r *http.Request) {
+	base := s.issuer()
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	writeJSON(w, 200, map[string]interface{}{
 		"issuer":                                base,
@@ -691,8 +642,8 @@ func handleOAuthMetadata(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
-	base := issuer()
+func (s *Server) handleProtectedResourceMetadata(w http.ResponseWriter, r *http.Request) {
+	base := s.issuer()
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	writeJSON(w, 200, map[string]interface{}{
 		"resource":                 base + "/mcp",
@@ -713,7 +664,7 @@ type oauthClient struct {
 	Scope                   string
 }
 
-func handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		errJSON(w, 405, "method not allowed")
 		return
@@ -776,14 +727,14 @@ func handleOAuthRegister(w http.ResponseWriter, r *http.Request) {
 	if name == "" {
 		name = "MCP client"
 	}
-	_, err := db.Exec(`INSERT INTO oauth_clients(client_id,client_secret_hash,client_name,redirect_uris,grant_types,scope,token_endpoint_auth_method,created_at)
+	_, err := s.DB.Exec(`INSERT INTO oauth_clients(client_id,client_secret_hash,client_name,redirect_uris,grant_types,scope,token_endpoint_auth_method,created_at)
 	                   VALUES(?,?,?,?,?,?,?,?)`,
-		clientID, secretHash, name, string(urisJSON), "authorization_code,refresh_token", scopes, method, nowUTC())
+		clientID, secretHash, name, string(urisJSON), "authorization_code,refresh_token", scopes, method, model.NowUTC())
 	if err != nil {
 		oauthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	logf("oauth client registered", "client_id", clientID, "client_name", name, "auth_method", method)
+	s.logf("oauth client registered", "client_id", clientID, "client_name", name, "auth_method", method)
 
 	resp := map[string]interface{}{
 		"client_id":                  clientID,
@@ -818,10 +769,10 @@ func validRedirectURI(raw string) bool {
 	return false
 }
 
-func loadOAuthClient(id string) (*oauthClient, error) {
+func (s *Server) loadOAuthClient(id string) (*oauthClient, error) {
 	var c oauthClient
 	var uris string
-	err := db.QueryRow(`SELECT client_id,client_name,redirect_uris,scope,token_endpoint_auth_method
+	err := s.DB.QueryRow(`SELECT client_id,client_name,redirect_uris,scope,token_endpoint_auth_method
 	                      FROM oauth_clients WHERE client_id=?`, id).
 		Scan(&c.ClientID, &c.ClientName, &uris, &c.Scope, &c.TokenEndpointAuthMethod)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -877,11 +828,11 @@ func parseAuthorizeParams(r *http.Request) authorizeParams {
 // validateAuthorize enforces the OAuth 2.1 profile MCP relies on: code flow,
 // PKCE with S256, exact redirect match. Errors that happen *before* the
 // redirect target is trusted are rendered, never redirected (RFC 6749 §4.1.2.1).
-func (p authorizeParams) validate() (*oauthClient, error) {
+func (s *Server) validateAuthorize(p authorizeParams) (*oauthClient, error) {
 	if p.ClientID == "" {
 		return nil, errors.New("client_id is required")
 	}
-	client, err := loadOAuthClient(p.ClientID)
+	client, err := s.loadOAuthClient(p.ClientID)
 	if err != nil {
 		return nil, err
 	}
@@ -961,7 +912,7 @@ var consentTemplate = template.Must(template.New("consent").Parse(`<!doctype htm
   <div class="sub" style="margin:16px 0 0">The client gets short-lived tokens bound to that key's owner and scopes. Revoke the key and every token dies with it.</div>
 </div></body></html>`))
 
-func renderConsent(w http.ResponseWriter, status int, p authorizeParams, client *oauthClient, msg string) {
+func (s *Server) renderConsent(w http.ResponseWriter, status int, p authorizeParams, client *oauthClient, msg string) {
 	hidden := []map[string]string{
 		{"Name": "client_id", "Value": p.ClientID},
 		{"Name": "redirect_uri", "Value": p.RedirectURI},
@@ -985,14 +936,14 @@ func renderConsent(w http.ResponseWriter, status int, p authorizeParams, client 
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'")
 	w.WriteHeader(status)
 	_ = consentTemplate.Execute(w, map[string]interface{}{
-		"ClientName": client.ClientName, "Issuer": issuer(), "RedirectURI": p.RedirectURI,
+		"ClientName": client.ClientName, "Issuer": s.issuer(), "RedirectURI": p.RedirectURI,
 		"Scopes": scopes, "Hidden": hidden, "Error": msg,
 	})
 }
 
-func handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	p := parseAuthorizeParams(r)
-	client, err := p.validate()
+	client, err := s.validateAuthorize(p)
 	if err != nil {
 		// Client/redirect are untrusted here: show the error, never redirect.
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -1002,7 +953,7 @@ func handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if r.Method == http.MethodGet {
-		renderConsent(w, http.StatusOK, p, client, "")
+		s.renderConsent(w, http.StatusOK, p, client, "")
 		return
 	}
 
@@ -1012,13 +963,13 @@ func handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rawKey := strings.TrimSpace(r.PostForm.Get("api_key"))
-	keyPrincipal, keyErr := lookupAPIKey(rawKey)
+	keyPrincipal, keyErr := s.lookupAPIKey(rawKey)
 	if keyErr != nil {
-		renderConsent(w, http.StatusUnauthorized, p, client, "That API key was not accepted: "+keyErr.Error())
+		s.renderConsent(w, http.StatusUnauthorized, p, client, "That API key was not accepted: "+keyErr.Error())
 		return
 	}
-	if keyPrincipal.ProjectID != "" && p.Resource != "" && !strings.HasPrefix(p.Resource, issuer()) {
-		renderConsent(w, http.StatusBadRequest, p, client, "This key is project-scoped and cannot be used for that resource.")
+	if keyPrincipal.ProjectID != "" && p.Resource != "" && !strings.HasPrefix(p.Resource, s.issuer()) {
+		s.renderConsent(w, http.StatusBadRequest, p, client, "This key is project-scoped and cannot be used for that resource.")
 		return
 	}
 
@@ -1047,20 +998,20 @@ func handleOAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	code := "efc_" + randToken(32)
 	resource := p.Resource
 	if resource == "" {
-		resource = issuer() + "/mcp"
+		resource = s.issuer() + "/mcp"
 	}
-	_, err = db.Exec(`INSERT INTO oauth_codes(code_hash,client_id,key_id,owner,project_id,redirect_uri,scope,
+	_, err = s.DB.Exec(`INSERT INTO oauth_codes(code_hash,client_id,key_id,owner,project_id,redirect_uri,scope,
 	                   code_challenge,code_challenge_method,resource,created_at,expires_at)
 	                  VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		hashToken(code), client.ClientID, keyPrincipal.KeyID, keyPrincipal.Owner,
 		nullIfEmpty(keyPrincipal.ProjectID), p.RedirectURI, scope,
-		p.CodeChallenge, "S256", resource, nowUTC(),
+		p.CodeChallenge, "S256", resource, model.NowUTC(),
 		time.Now().UTC().Add(authCodeTTL).Format(time.RFC3339Nano))
 	if err != nil {
 		redirectWithError(w, r, p, "server_error", err.Error())
 		return
 	}
-	logf("oauth code issued", "client_id", client.ClientID, "owner", keyPrincipal.Owner, "scope", scope)
+	s.logf("oauth code issued", "client_id", client.ClientID, "owner", keyPrincipal.Owner, "scope", scope)
 
 	target, _ := url.Parse(p.RedirectURI)
 	q := target.Query()
@@ -1099,8 +1050,8 @@ func oauthError(w http.ResponseWriter, status int, code, desc string) {
 
 // clientFromRequest authenticates a confidential client. Public clients send
 // nothing, which is why PKCE is mandatory rather than optional here.
-func clientFromRequest(r *http.Request, clientID string) (*oauthClient, error) {
-	c, err := loadOAuthClient(clientID)
+func (s *Server) clientFromRequest(r *http.Request, clientID string) (*oauthClient, error) {
+	c, err := s.loadOAuthClient(clientID)
 	if err != nil {
 		return nil, err
 	}
@@ -1114,7 +1065,7 @@ func clientFromRequest(r *http.Request, clientID string) (*oauthClient, error) {
 		}
 	}
 	var stored sql.NullString
-	if err := db.QueryRow(`SELECT client_secret_hash FROM oauth_clients WHERE client_id=?`, clientID).Scan(&stored); err != nil {
+	if err := s.DB.QueryRow(`SELECT client_secret_hash FROM oauth_clients WHERE client_id=?`, clientID).Scan(&stored); err != nil {
 		return nil, err
 	}
 	if !stored.Valid || !constEqual(hashToken(secret), stored.String) {
@@ -1123,7 +1074,7 @@ func clientFromRequest(r *http.Request, clientID string) (*oauthClient, error) {
 	return c, nil
 }
 
-func handleOAuthToken(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		oauthError(w, http.StatusMethodNotAllowed, "invalid_request", "POST required")
 		return
@@ -1135,16 +1086,16 @@ func handleOAuthToken(w http.ResponseWriter, r *http.Request) {
 	grant := r.PostForm.Get("grant_type")
 	switch grant {
 	case "authorization_code":
-		handleAuthCodeGrant(w, r)
+		s.handleAuthCodeGrant(w, r)
 	case "refresh_token":
-		handleRefreshGrant(w, r)
+		s.handleRefreshGrant(w, r)
 	default:
 		oauthError(w, http.StatusBadRequest, "unsupported_grant_type",
 			fmt.Sprintf("grant_type %q is not supported", grant))
 	}
 }
 
-func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 	code := r.PostForm.Get("code")
 	clientID := r.PostForm.Get("client_id")
 	redirectURI := r.PostForm.Get("redirect_uri")
@@ -1158,7 +1109,7 @@ func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_request", "code_verifier must be 43-128 base64url characters")
 		return
 	}
-	if _, err := clientFromRequest(r, clientID); err != nil {
+	if _, err := s.clientFromRequest(r, clientID); err != nil {
 		oauthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
@@ -1168,7 +1119,7 @@ func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 		resource                                                          sql.NullString
 		projectID, used                                                   sql.NullString
 	)
-	err := db.QueryRow(`SELECT key_id,owner,redirect_uri,scope,code_challenge,code_challenge_method,
+	err := s.DB.QueryRow(`SELECT key_id,owner,redirect_uri,scope,code_challenge,code_challenge_method,
 	                           resource,project_id,expires_at,used_at
 	                      FROM oauth_codes WHERE code_hash=? AND client_id=?`, hashToken(code), clientID).
 		Scan(&keyID, &owner, &storedRedirect, &scope, &challenge, &method, &resource, &projectID, &expiresAt, &used)
@@ -1182,7 +1133,7 @@ func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	if used.Valid && used.String != "" {
 		// A replayed code means the code leaked: kill everything it produced.
-		revokeTokensForClientKey(clientID, keyID)
+		s.revokeTokensForClientKey(clientID, keyID)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "authorization code has already been redeemed")
 		return
 	}
@@ -1200,7 +1151,7 @@ func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	// Single use: the conditional update is the lock, so two racing exchanges
 	// cannot both succeed.
-	res, err := db.Exec(`UPDATE oauth_codes SET used_at=? WHERE code_hash=? AND used_at IS NULL`, nowUTC(), hashToken(code))
+	res, err := s.DB.Exec(`UPDATE oauth_codes SET used_at=? WHERE code_hash=? AND used_at IS NULL`, model.NowUTC(), hashToken(code))
 	if err != nil {
 		oauthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1210,24 +1161,24 @@ func handleAuthCodeGrant(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	pair, err := issueTokenPair(clientID, keyID, owner, projectID.String, scope, resource.String, "")
+	pair, err := s.issueTokenPair(clientID, keyID, owner, projectID.String, scope, resource.String, "")
 	if err != nil {
 		oauthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
 	}
-	logf("oauth token issued", "client_id", clientID, "owner", owner)
+	s.logf("oauth token issued", "client_id", clientID, "owner", owner)
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, pair)
 }
 
-func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	refresh := r.PostForm.Get("refresh_token")
 	clientID := r.PostForm.Get("client_id")
 	if refresh == "" || clientID == "" {
 		oauthError(w, http.StatusBadRequest, "invalid_request", "refresh_token and client_id are required")
 		return
 	}
-	if _, err := clientFromRequest(r, clientID); err != nil {
+	if _, err := s.clientFromRequest(r, clientID); err != nil {
 		oauthError(w, http.StatusUnauthorized, "invalid_client", err.Error())
 		return
 	}
@@ -1235,7 +1186,7 @@ func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		keyID, owner, scope, expiresAt string
 		projectID, resource, revoked   sql.NullString
 	)
-	err := db.QueryRow(`SELECT key_id,owner,scope,resource,project_id,expires_at,revoked_at
+	err := s.DB.QueryRow(`SELECT key_id,owner,scope,resource,project_id,expires_at,revoked_at
 	                      FROM oauth_tokens WHERE token_hash=? AND kind='refresh' AND client_id=?`,
 		hashToken(refresh), clientID).
 		Scan(&keyID, &owner, &scope, &resource, &projectID, &expiresAt, &revoked)
@@ -1249,8 +1200,8 @@ func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	}
 	if revoked.Valid && revoked.String != "" {
 		// Reuse of a rotated refresh token: the family is compromised.
-		revokeTokensForClientKey(clientID, keyID)
-		logf("refresh token reuse detected; revoked family", "client_id", clientID, "key_id", keyID)
+		s.revokeTokensForClientKey(clientID, keyID)
+		s.logf("refresh token reuse detected; revoked family", "client_id", clientID, "key_id", keyID)
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token already used; all tokens for this client were revoked")
 		return
 	}
@@ -1258,12 +1209,12 @@ func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token expired")
 		return
 	}
-	if _, err := lookupAPIKeyByID(keyID); err != nil {
+	if _, err := s.lookupAPIKeyByID(keyID); err != nil {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", err.Error())
 		return
 	}
-	res, err := db.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`,
-		nowUTC(), hashToken(refresh))
+	res, err := s.DB.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE token_hash=? AND revoked_at IS NULL`,
+		model.NowUTC(), hashToken(refresh))
 	if err != nil {
 		oauthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1272,7 +1223,7 @@ func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 		oauthError(w, http.StatusBadRequest, "invalid_grant", "refresh token already redeemed")
 		return
 	}
-	pair, err := issueTokenPair(clientID, keyID, owner, projectID.String, scope, resource.String, hashToken(refresh))
+	pair, err := s.issueTokenPair(clientID, keyID, owner, projectID.String, scope, resource.String, hashToken(refresh))
 	if err != nil {
 		oauthError(w, http.StatusInternalServerError, "server_error", err.Error())
 		return
@@ -1281,14 +1232,14 @@ func handleRefreshGrant(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, pair)
 }
 
-func revokeTokensForClientKey(clientID, keyID string) {
-	_, _ = db.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE client_id=? AND key_id=? AND revoked_at IS NULL`,
-		nowUTC(), clientID, keyID)
+func (s *Server) revokeTokensForClientKey(clientID, keyID string) {
+	_, _ = s.DB.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE client_id=? AND key_id=? AND revoked_at IS NULL`,
+		model.NowUTC(), clientID, keyID)
 }
 
 // ---------- revocation (RFC 7009) ----------
 
-func handleOAuthRevoke(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleOAuthRevoke(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		oauthError(w, http.StatusMethodNotAllowed, "invalid_request", "POST required")
 		return
@@ -1304,17 +1255,17 @@ func handleOAuthRevoke(w http.ResponseWriter, r *http.Request) {
 	}
 	h := hashToken(token)
 	var clientID, keyID, kind string
-	err := db.QueryRow(`SELECT client_id,key_id,kind FROM oauth_tokens WHERE token_hash=?`, h).
+	err := s.DB.QueryRow(`SELECT client_id,key_id,kind FROM oauth_tokens WHERE token_hash=?`, h).
 		Scan(&clientID, &keyID, &kind)
 	if err == nil {
 		// Revoking a refresh token revokes the whole family, otherwise the
 		// holder of the access token keeps working after a "revoke".
 		if kind == "refresh" {
-			revokeTokensForClientKey(clientID, keyID)
+			s.revokeTokensForClientKey(clientID, keyID)
 		} else {
-			_, _ = db.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE token_hash=?`, nowUTC(), h)
+			_, _ = s.DB.Exec(`UPDATE oauth_tokens SET revoked_at=? WHERE token_hash=?`, model.NowUTC(), h)
 		}
-		logf("token revoked", "client_id", clientID, "kind", kind)
+		s.logf("token revoked", "client_id", clientID, "kind", kind)
 	}
 	// RFC 7009 §2.2: always 200, even for unknown tokens.
 	w.Header().Set("Cache-Control", "no-store")
@@ -1325,74 +1276,23 @@ func handleOAuthRevoke(w http.ResponseWriter, r *http.Request) {
 
 // scrubAuth deletes credentials that expired long enough ago to be useless.
 // Opik ships the same job as a token scrub worker; here it is a ticker.
-func scrubAuth() (codes, tokens int64) {
+func (s *Server) scrubAuth() (codes, tokens int64) {
 	cutoff := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
-	if r, err := db.Exec(`DELETE FROM oauth_codes WHERE expires_at < ?`, cutoff); err == nil {
+	if r, err := s.DB.Exec(`DELETE FROM oauth_codes WHERE expires_at < ?`, cutoff); err == nil {
 		codes, _ = r.RowsAffected()
 	}
 	old := time.Now().UTC().Add(-30 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if r, err := db.Exec(`DELETE FROM oauth_tokens WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)`,
+	if r, err := s.DB.Exec(`DELETE FROM oauth_tokens WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)`,
 		old, old); err == nil {
 		tokens, _ = r.RowsAffected()
 	}
 	if codes+tokens > 0 {
-		logf("auth scrub", "codes", codes, "tokens", tokens)
+		s.logf("auth scrub", "codes", codes, "tokens", tokens)
 	}
 	return
 }
 
-func startAuthScrubber(ctx context.Context) {
-	scrubAuth()
-	go func() {
-		t := time.NewTicker(time.Hour)
-		defer t.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-t.C:
-				scrubAuth()
-			}
-		}
-	}()
-}
-
-// mintAPIKey prints a fresh key for bootstrapping without HTTP. It is a CLI
-// affordance (`evalforge --create-key "name" --owner a@b`), not an API.
-func mintAPIKey(args []string) {
-	if err := openDB(); err != nil {
-		fmt.Fprintln(os.Stderr, "db open:", err)
-		os.Exit(1)
-	}
-	defer db.Close()
-	name, owner, projectID := "", "", ""
-	scopes := map[string]bool{"read": true, "write": true, "admin": true}
-	for i := 0; i < len(args); i++ {
-		switch args[i] {
-		case "--owner":
-			if i+1 < len(args) {
-				i++
-				owner = args[i]
-			}
-		case "--project":
-			if i+1 < len(args) {
-				i++
-				projectID = args[i]
-			}
-		default:
-			if name == "" && !strings.HasPrefix(args[i], "--") {
-				name = args[i]
-			}
-		}
-	}
-	if name == "" {
-		name = "bootstrap"
-	}
-	raw, key, err := insertAPIKey(name, owner, scopes, projectID, 0)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "create key:", err)
-		os.Exit(1)
-	}
-	fmt.Fprintf(os.Stderr, "created %s (%s…) for owner %q; stdout carries the key\n", key.ID, key.Prefix, owner)
-	fmt.Println(raw)
-}
+// issuer is the public origin used in discovery documents and token audiences.
+// PUBLIC_BASE_URL exists because a proxied deployment is not reachable at the
+// address the process listens on.
+func (s *Server) issuer() string { return s.baseURL }

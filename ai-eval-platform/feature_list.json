@@ -1,0 +1,103 @@
+{
+  "features": [
+    {
+      "id": "feat-001",
+      "name": "Idiomatic Go Restructure",
+      "description": "Refactor the monolithic server-go/main.go (1721 lines) into the idiomatic Go layout from OPIK_ALIGNMENT.md \u00a75: cmd/server/main.go, internal/{config,database,model,repository,service,api,worker}. Constructor injection, interfaces, no globals. This is the foundation for everything else.",
+      "dependencies": [],
+      "status": "done",
+      "evidence": "server-go/cmd/server/main.go + internal/{config,logging,database,model,queue,worker,api}. Handlers are Server methods; no package-level db/dbMu/logger. go build ./... and go test ./... green."
+    },
+    {
+      "id": "feat-002",
+      "name": "Typed Errors & Error Middleware",
+      "description": "Define api.Error{Code,Message,Status,Err}. Every handler returns it, one middleware renders JSON and logs the cause with request ID. Never render err.Error() of a driver error to a client. (OPIK_ALIGNMENT D7)",
+      "dependencies": [
+        "feat-001"
+      ],
+      "status": "not-started",
+      "evidence": ""
+    },
+    {
+      "id": "feat-003",
+      "name": "Validated Config Struct",
+      "description": "internal/config with typed struct, defaults, Validate(). All ~20 os.Getenv calls become fields loaded once at boot. Fail fast on bad values. (OPIK_ALIGNMENT D8)",
+      "dependencies": [
+        "feat-001"
+      ],
+      "status": "done",
+      "evidence": "internal/config/config.go: typed Config, Load(), Validate(), AuthRequired(), Issuer(). Bad AUTH_MODE/LOG_LEVEL/URL fails startup."
+    },
+    {
+      "id": "feat-004",
+      "name": "Embedded SQL Migrations",
+      "description": "Replace CREATE TABLE IF NOT EXISTS blob with numbered migrations in internal/database/migrations/ using embed.FS. Track in schema_migrations table. Forward-only. (OPIK_ALIGNMENT D10)",
+      "dependencies": [
+        "feat-001"
+      ],
+      "status": "done",
+      "evidence": "internal/database/db.go + embedded migrations/0001_init.sql, 0002_product.sql; schema_migrations tracked, each migration transactional, legacy import preserved."
+    },
+    {
+      "id": "feat-005",
+      "name": "Repository Interfaces (MetadataStore + TelemetryStore)",
+      "description": "Define TelemetryStore and MetadataStore interfaces per OPIK_ALIGNMENT D1. SQLite implementations in internal/repository/sqlite/. Both backed by same *sql.DB for now, but swappable. This is what makes a ClickHouse migration possible without rewriting handlers.",
+      "dependencies": [
+        "feat-001"
+      ],
+      "status": "not-started",
+      "evidence": ""
+    },
+    {
+      "id": "feat-006",
+      "name": "Dataset Versioning (Immutable Snapshots)",
+      "description": "Implement dataset_versions table with content hash, full item snapshot, delta counts. Experiments pin dataset_version_id at creation. Worker reads the snapshot, not the live table. (OPIK_ALIGNMENT D3)",
+      "dependencies": [
+        "feat-005"
+      ],
+      "status": "done",
+      "evidence": "dataset_versions stores full items_json + SHA-256 hash + delta counts; handlers snapshot inside the write transaction; experiments pin dataset_version_id; worker reads /dataset_versions/{id}. Verified by Go tests and smoke (version=3)."
+    },
+    {
+      "id": "feat-007",
+      "name": "Prompt Versioning & Eval Integration",
+      "description": "Prompts become append-only prompt_versions with commit hash. POST /evaluations accepts prompt:{name, version}. The resolved template is passed to the worker and recorded on the experiment. (OPIK_ALIGNMENT D4)",
+      "dependencies": [
+        "feat-005"
+      ],
+      "status": "done",
+      "evidence": "Experiments resolve and store prompt_version_id; POST /evaluations accepts prompt_name+prompt_version or prompt_version_id; worker fetches /prompts/{id} and renders the template. UI prompt selector + pinned rerun."
+    },
+    {
+      "id": "feat-008",
+      "name": "Feedback Definitions (Scorer Registry in DB)",
+      "description": "Move scorer registry from Go literals to the database. Seed builtins on first boot, expose POST /feedback-definitions for custom numerical/categorical scorers. (OPIK_ALIGNMENT D5)",
+      "dependencies": [
+        "feat-005"
+      ],
+      "status": "not-started",
+      "evidence": ""
+    },
+    {
+      "id": "feat-009",
+      "name": "Go httptest Test Suite",
+      "description": "Table-driven httptest tests for every handler group against a temp SQLite file. Assert status codes, error bodies, one end-to-end path per resource. At least 80% route coverage. (OPIK_ALIGNMENT D11)",
+      "dependencies": [
+        "feat-002",
+        "feat-005"
+      ],
+      "status": "in-progress",
+      "evidence": "internal/api has httptest suites for auth/OAuth/MCP (44 path), OTLP protobuf+JSON, dataset snapshots, prompt pinning, token provenance, scoped access. Full route-coverage target not yet measured."
+    },
+    {
+      "id": "feat-010",
+      "name": "Smoke & Regression Test Pass",
+      "description": "All existing test suites pass after restructure: smoke_api.py (31), auth_test.py (44), mcp_test.py (23), fault_test.py (16). This gates every merge.",
+      "dependencies": [
+        "feat-009"
+      ],
+      "status": "done",
+      "evidence": "Go tests green; smoke 31/31; auth 44/44; MCP 23/23; fault 16/16 (crash/restart, timeout, retry); load 360 traces, 0 errors, ~1000 spans/s ingest."
+    }
+  ]
+}

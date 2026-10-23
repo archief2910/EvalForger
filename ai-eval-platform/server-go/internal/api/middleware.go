@@ -1,13 +1,11 @@
-package main
+package api
 
 // HTTP plumbing: correlation ids, panic recovery, access logging, CORS.
 // These wrap the router so every handler gets them for free.
 
 import (
 	"context"
-	"log/slog"
 	"net/http"
-	"os"
 	"sync/atomic"
 	"time"
 )
@@ -27,11 +25,6 @@ func setAuditOwner(ctx context.Context, owner string) {
 		*slot = owner
 	}
 }
-
-var logger = slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelInfo}))
-
-// logf keeps the call sites short while emitting structured events.
-func logf(msg string, args ...any) { logger.Info(msg, args...) }
 
 // statusRecorder captures the status code for the access log without changing
 // handler behaviour.
@@ -55,7 +48,7 @@ func (s *statusRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
-func requestID(next http.Handler) http.Handler {
+func (s *Server) requestID(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		id := r.Header.Get("X-Request-Id")
 		if id == "" {
@@ -67,11 +60,11 @@ func requestID(next http.Handler) http.Handler {
 	})
 }
 
-func recoverPanic(next http.Handler) http.Handler {
+func (s *Server) recoverPanic(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
 			if rec := recover(); rec != nil {
-				logger.Error("panic", "request_id", requestIDOf(r), "path", r.URL.Path, "panic", rec)
+				s.log.Error("panic", "request_id", requestIDOf(r), "path", r.URL.Path, "panic", rec)
 				// The header may already be written; errJSON on a hijacked
 				// writer would double-write, so encode directly.
 				w.Header().Set("Content-Type", "application/json")
@@ -83,7 +76,7 @@ func recoverPanic(next http.Handler) http.Handler {
 	})
 }
 
-func accessLog(next http.Handler) http.Handler {
+func (s *Server) accessLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		rec := &statusRecorder{ResponseWriter: w}
@@ -104,11 +97,11 @@ func accessLog(next http.Handler) http.Handler {
 		if owner != "" {
 			slogArgs = append(slogArgs, "owner", owner)
 		}
-		logger.Info("http", slogArgs...)
+		s.log.Info("http", slogArgs...)
 	})
 }
 
-func cors(next http.Handler) http.Handler {
+func (s *Server) cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -127,8 +120,8 @@ func cors(next http.Handler) http.Handler {
 // recovery sits inside requestID so a recovered panic still carries the id.
 // `authenticate` wraps the router itself (see main), so a rejected request is
 // still logged with its request id and duration.
-func withMiddleware(next http.Handler) http.Handler {
-	return cors(requestID(recoverPanic(accessLog(next))))
+func (s *Server) withMiddleware(next http.Handler) http.Handler {
+	return s.cors(s.requestID(s.recoverPanic(s.accessLog(next))))
 }
 
 func requestIDOf(r *http.Request) string {

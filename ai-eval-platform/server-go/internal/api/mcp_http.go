@@ -1,4 +1,4 @@
-package main
+package api
 
 // MCP Streamable HTTP transport (spec revision 2025-06-18).
 //
@@ -24,10 +24,10 @@ import (
 
 const mcpMaxBody = 4 << 20
 
-func handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodPost:
-		handleMCPPost(w, r)
+		s.handleMCPPost(w, r)
 	case http.MethodGet, http.MethodDelete:
 		// No server-initiated stream and no sessions to terminate. The spec
 		// allows 405 with an Allow header for exactly this server shape.
@@ -43,7 +43,7 @@ func handleMCPHTTP(w http.ResponseWriter, r *http.Request) {
 // checkMCPOrigin rejects cross-site browser origins. Without this, a malicious
 // page could drive a localhost MCP server with the user's ambient credentials
 // (DNS-rebinding class of attack; the MCP spec requires Origin validation).
-func checkMCPOrigin(r *http.Request) error {
+func (s *Server) checkMCPOrigin(r *http.Request) error {
 	origin := r.Header.Get("Origin")
 	if origin == "" {
 		return nil // native MCP clients do not send Origin
@@ -52,7 +52,7 @@ func checkMCPOrigin(r *http.Request) error {
 	if err != nil || u.Host == "" {
 		return errors.New("invalid Origin header")
 	}
-	base, err := url.Parse(issuer())
+	base, err := url.Parse(s.issuer())
 	if err == nil && strings.EqualFold(u.Host, base.Host) {
 		return nil
 	}
@@ -66,8 +66,8 @@ func isLoopbackHost(h string) bool {
 	return h == "localhost" || h == "127.0.0.1" || h == "::1" || h == "[::1]"
 }
 
-func handleMCPPost(w http.ResponseWriter, r *http.Request) {
-	if err := checkMCPOrigin(r); err != nil {
+func (s *Server) handleMCPPost(w http.ResponseWriter, r *http.Request) {
+	if err := s.checkMCPOrigin(r); err != nil {
 		errJSON(w, http.StatusForbidden, err.Error())
 		return
 	}
@@ -111,10 +111,10 @@ func handleMCPPost(w http.ResponseWriter, r *http.Request) {
 		out := make([]map[string]interface{}, 0, len(batch))
 		for _, req := range batch {
 			if len(req.ID) == 0 {
-				mcpDispatch(ctx, req) // notifications: handle, never answer
+				s.mcpDispatch(ctx, req) // notifications: handle, never answer
 				continue
 			}
-			if resp := mcpDispatch(ctx, req); resp != nil {
+			if resp := s.mcpDispatch(ctx, req); resp != nil {
 				out = append(out, resp)
 			}
 		}
@@ -132,9 +132,9 @@ func handleMCPPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if len(req.ID) == 0 {
-		mcpDispatch(ctx, req)
+		s.mcpDispatch(ctx, req)
 		w.WriteHeader(http.StatusAccepted)
 		return
 	}
-	writeJSON(w, http.StatusOK, mcpDispatch(ctx, req))
+	writeJSON(w, http.StatusOK, s.mcpDispatch(ctx, req))
 }

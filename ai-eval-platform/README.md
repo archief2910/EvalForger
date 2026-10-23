@@ -21,11 +21,25 @@ Open [docs/architecture.html](docs/architecture.html) in a browser for the rende
 - **Frontend**: React 19 + Vite, original dark UI (`frontend/`), proxies `/api` → `localhost:8000`.
 - **SDK sample**: `sdk/sample_client.py` — proves the ingestion surface (batching, nested spans, flush).
 
+### Go layout
+```
+server-go/
+  cmd/server/main.go        # flags, config, migrate, serve, graceful shutdown
+  internal/config/          # typed env config + validation
+  internal/database/        # SQLite pool, embedded migrations, legacy import
+  internal/model/           # domain types, pricing, token estimation
+  internal/queue/           # durable claim/lease/heartbeat/retry queue
+  internal/worker/          # Python subprocess boundary
+  internal/api/             # routing, handlers, auth, OTLP, MCP, versioning
+```
+Handlers are methods on `api.Server`; dependencies are constructor-injected. The binary is built with
+`go build ./cmd/server`, not from the repository root.
+
 ## Run it
 ```bash
 # 1) API server (from ai-eval-platform/server-go)
 cd ai-eval-platform/server-go
-go build -o evalforge.exe . && ./evalforge.exe     # → http://localhost:8000
+go build -o evalforge.exe ./cmd/server && ./evalforge.exe     # → http://localhost:8000
 
 # 2) demo data (seeds a project with 36 traces, 2 datasets, 2 prompts)
 cd ai-eval-platform && python worker-py/seed.py
@@ -54,9 +68,9 @@ answer. The worker handles that by escalating `max_tokens` and retrying, and rec
 1. **Logs & Traces** — filter by status/model/has-feedback, open a trace: nested span tree + timeline, per-span tokens/cost.
 2. **Review** — thumbs + comment on a trace, edit the *expected* answer.
 3. **Add to dataset** — one click promotes the trace (`input` copied, `expected` = your corrected answer, `metadata.origin_trace_id` = reference back to the trace).
-4. **Run evaluation** — pick a dataset, select scorers (deterministic + LLM-as-judge), choose a baseline experiment → an immutable experiment is created.
-5. **Compare** — per-case deltas by input alignment; improvement/regression badges per scorer.
-6. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown.
+4. **Run evaluation** — pick a dataset, select scorers (deterministic + LLM-as-judge), optionally pin a prompt version, choose a baseline experiment → an immutable experiment is created. The dataset is snapshotted first, so later edits cannot change what the run saw.
+5. **Compare** — per-case deltas by input alignment; improvement/regression badges per scorer. **Rerun pinned** reuses the same dataset snapshot and prompt version.
+6. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown. Token counts reported by the provider are labelled `provider`; estimates are labelled `estimated` in the trace view.
 
 ## API surface (`/api/v1`)
 | Area | Endpoints |
@@ -65,9 +79,9 @@ answer. The worker handles that by escalating `max_tokens` and retrying, and rec
 | Ingest | `POST /projects/{id}/spans:ingest` (batch of span events), `POST /v1/traces` (OTLP/HTTP, protobuf + JSON) |
 | Observe | `GET /projects/{id}/traces`, `GET /projects/{id}/traces/{trace_id}`, `POST /projects/{id}/traces/{trace_id}/feedback` |
 | Dashboard | `GET /projects/{id}/dashboard` |
-| Datasets | `GET/POST /projects/{id}/datasets`, `GET /datasets/{id}`, `POST /datasets/{id}/records` (single object **or** array), `POST /datasets/{id}/records:from_trace` |
+| Datasets | `GET/POST /projects/{id}/datasets`, `GET /datasets/{id}`, `POST /datasets/{id}/records` (single object **or** array), `POST /datasets/{id}/records:from_trace`, `GET /datasets/{id}/versions`, `GET /dataset_versions/{id}` |
 | Evaluate | `GET /scorers`, `POST /projects/{id}/evaluations`, `GET /projects/{id}/experiments`, `GET /experiments/{id}`, `GET /experiments/{id}/compare?baseline_id=` |
-| Prompts | `GET/POST /projects/{id}/prompts` |
+| Prompts | `GET/POST /projects/{id}/prompts`, `GET /prompts/{version_id}` |
 | Credentials | `GET/POST /keys`, `DELETE /keys/{id}`, `GET /whoami` |
 | Worker | `POST /worker_callback/{experiment_id}` (results written by the Python worker) |
 

@@ -1,7 +1,7 @@
-package main
+package api
 
 // Auth tests drive the real router behind the real middleware, so what is
-// exercised here is the wiring the binary ships — not a hand-assembled subset.
+// exercised here is the wiring the binary ships - not a hand-assembled subset.
 //
 // Covered: key minting and revocation, scope enforcement, project scoping, the
 // full authorization-code + PKCE exchange (including every failure mode that
@@ -16,34 +16,11 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 )
-
-type testEnv struct {
-	srv *httptest.Server
-}
-
-func newTestEnv(t *testing.T) *testEnv {
-	t.Helper()
-	t.Setenv("DATA_DIR", t.TempDir())
-	t.Setenv("AUTH_MODE", "required")
-	t.Setenv("PUBLIC_BASE_URL", "")
-	if err := openDB(); err != nil {
-		t.Fatalf("openDB: %v", err)
-	}
-	srv := httptest.NewServer(withMiddleware(authenticate(newRouter())))
-	selfBaseURL = srv.URL
-	mcpBaseURL = srv.URL
-	t.Cleanup(func() {
-		srv.Close()
-		_ = db.Close()
-	})
-	return &testEnv{srv: srv}
-}
 
 // do issues a request with optional bearer and JSON body, returning status, raw
 // body and headers.
@@ -258,6 +235,19 @@ func TestProjectScopedKeyCannotCrossProjects(t *testing.T) {
 	}
 	if strings.Contains(string(raw), p2) || !strings.Contains(string(raw), p1) {
 		t.Fatalf("project list not scoped: %s", raw)
+	}
+
+	// Resources addressed by id (no project in the path) are scoped too.
+	_, own := e.json(t, "POST", "/api/v1/projects/"+p1+"/datasets", admin, map[string]interface{}{"name": "mine"})
+	_, other := e.json(t, "POST", "/api/v1/projects/"+p2+"/datasets", admin, map[string]interface{}{"name": "theirs"})
+	if status, _, _ := e.do(t, "GET", "/api/v1/datasets/"+own["id"].(string), key, nil, nil); status != 200 {
+		t.Fatalf("scoped key cannot read its own dataset: %d", status)
+	}
+	if status, _, _ := e.do(t, "GET", "/api/v1/datasets/"+other["id"].(string), key, nil, nil); status != 404 {
+		t.Fatalf("scoped key read another project's dataset: got %d want 404", status)
+	}
+	if status, _, _ := e.do(t, "GET", "/api/v1/datasets/"+other["id"].(string)+"/versions", key, nil, nil); status != 404 {
+		t.Fatalf("scoped key listed another project's versions: got %d want 404", status)
 	}
 }
 
@@ -583,24 +573,24 @@ func TestScrubAuthDropsStaleRows(t *testing.T) {
 	_ = admin
 	old := time.Now().UTC().Add(-3 * time.Hour).Format(time.RFC3339Nano)
 	stale := time.Now().UTC().Add(-40 * 24 * time.Hour).Format(time.RFC3339Nano)
-	if _, err := db.Exec(`INSERT INTO oauth_codes(code_hash,client_id,key_id,redirect_uri,scope,code_challenge,created_at,expires_at)
+	if _, err := e.s.DB.Exec(`INSERT INTO oauth_codes(code_hash,client_id,key_id,redirect_uri,scope,code_challenge,created_at,expires_at)
 	                       VALUES('h1','c','k','u','read','chal',?,?)`, old, old); err != nil {
 		t.Fatalf("insert code: %v", err)
 	}
-	if _, err := db.Exec(`INSERT INTO oauth_tokens(token_hash,kind,client_id,key_id,scope,created_at,expires_at)
+	if _, err := e.s.DB.Exec(`INSERT INTO oauth_tokens(token_hash,kind,client_id,key_id,scope,created_at,expires_at)
 	                       VALUES('h2','access','c','k','read',?,?)`, stale, stale); err != nil {
 		t.Fatalf("insert token: %v", err)
 	}
-	codes, tokens := scrubAuth()
+	codes, tokens := e.s.scrubAuth()
 	if codes < 1 || tokens < 1 {
 		t.Fatalf("scrub removed codes=%d tokens=%d, want at least one of each", codes, tokens)
 	}
 	var n int
-	_ = db.QueryRow(`SELECT COUNT(*) FROM oauth_codes WHERE code_hash='h1'`).Scan(&n)
+	_ = e.s.DB.QueryRow(`SELECT COUNT(*) FROM oauth_codes WHERE code_hash='h1'`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("stale code survived scrub")
 	}
-	_ = db.QueryRow(`SELECT COUNT(*) FROM oauth_tokens WHERE token_hash='h2'`).Scan(&n)
+	_ = e.s.DB.QueryRow(`SELECT COUNT(*) FROM oauth_tokens WHERE token_hash='h2'`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("stale token survived scrub")
 	}

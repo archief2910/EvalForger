@@ -1,4 +1,4 @@
-package main
+package api
 
 // OTLP/HTTP trace ingest.
 //
@@ -21,6 +21,8 @@ import (
 	"strings"
 	"time"
 
+	"evalforge/internal/model"
+
 	collectortrace "go.opentelemetry.io/proto/otlp/collector/trace/v1"
 	commonpb "go.opentelemetry.io/proto/otlp/common/v1"
 	tracepb "go.opentelemetry.io/proto/otlp/trace/v1"
@@ -28,27 +30,17 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// spanRow is the storage-shaped span shared by both ingest paths.
-type spanRow struct {
-	ID, TraceID, ParentID, Name, Type, Model string
-	Input, Output, Error, Metadata           interface{}
-	StartMS, EndMS, LatencyMS                int64
-	PromptTokens, CompletionTokens           int
-	CostUSD                                  float64
-	Status                                   string
-}
-
 // insertSpanTx writes one span inside the caller's transaction. Callers own
 // locking/serialisation so this function never opens its own connection.
-func insertSpanTx(tx *sql.Tx, projectID string, s spanRow, now string) error {
+func insertSpanTx(tx *sql.Tx, projectID string, row model.SpanRow, now string) error {
 	_, err := tx.Exec(`INSERT OR REPLACE INTO spans(id, trace_id, parent_id, name, type, model,
 		input, output, error, metadata, start_ms, end_ms, latency_ms,
-		prompt_tokens, completion_tokens, cost_usd, status, project_id, created_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		s.ID, s.TraceID, nilIfEmpty(s.ParentID), s.Name, s.Type, nilIfEmpty(s.Model),
-		jsonOrNull(s.Input), jsonOrNull(s.Output), jsonOrNull(s.Error), jsonOrNull(s.Metadata),
-		s.StartMS, s.EndMS, s.LatencyMS, s.PromptTokens, s.CompletionTokens, s.CostUSD,
-		s.Status, projectID, now)
+		prompt_tokens, completion_tokens, cost_usd, status, project_id, created_at, token_source)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		row.ID, row.TraceID, nilIfEmpty(row.ParentID), row.Name, row.Type, nilIfEmpty(row.Model),
+		jsonOrNull(row.Input), jsonOrNull(row.Output), jsonOrNull(row.Error), jsonOrNull(row.Metadata),
+		row.StartMS, row.EndMS, row.LatencyMS, row.PromptTokens, row.CompletionTokens, row.CostUSD,
+		row.Status, projectID, now, row.TokenSource)
 	return err
 }
 
@@ -67,13 +59,13 @@ func rollupTraceTx(tx *sql.Tx) {
 
 // projectByName resolves a project for OTLP batches, creating it on first use
 // the way Opik does (a collector should be able to point at an empty server).
-func projectByName(name string) (string, error) {
+func (s *Server) projectByName(name string) (string, error) {
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = "default"
 	}
 	var id string
-	err := db.QueryRow(`SELECT id FROM projects WHERE name=? ORDER BY created_at LIMIT 1`, name).Scan(&id)
+	err := s.DB.QueryRow(`SELECT id FROM projects WHERE name=? ORDER BY created_at LIMIT 1`, name).Scan(&id)
 	if err == nil {
 		return id, nil
 	}
@@ -81,13 +73,13 @@ func projectByName(name string) (string, error) {
 		return "", err
 	}
 	id = newID()
-	dbMu.Lock()
-	_, err = db.Exec(`INSERT INTO projects(id, name, description, created_at) VALUES (?,?,?,?)`,
+	s.dbMu.Lock()
+	_, err = s.DB.Exec(`INSERT INTO projects(id, name, description, created_at) VALUES (?,?,?,?)`,
 		id, name, "created by OTLP ingest", time.Now().UTC().Format(time.RFC3339Nano))
-	dbMu.Unlock()
+	s.dbMu.Unlock()
 	if err != nil {
 		// lost a race with a concurrent batch for the same new project
-		if e := db.QueryRow(`SELECT id FROM projects WHERE name=? LIMIT 1`, name).Scan(&id); e == nil {
+		if e := s.DB.QueryRow(`SELECT id FROM projects WHERE name=? LIMIT 1`, name).Scan(&id); e == nil {
 			return id, nil
 		}
 		return "", err
@@ -200,9 +192,9 @@ func isZeroID(b []byte) bool {
 }
 
 // otelToRow converts one OTLP span into the storage row.
-func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) spanRow {
+func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) model.SpanRow {
 	attrs := attrsOf(sp.GetAttributes())
-	model := firstString(attrs, "gen_ai.request.model", "gen_ai.response.model",
+	modelName := firstString(attrs, "gen_ai.request.model", "gen_ai.response.model",
 		"llm.model_name", "ai.model.name", "model")
 	kind := firstString(attrs, "openinference.span.kind", "gen_ai.operation.name", "span.kind")
 
@@ -238,7 +230,7 @@ func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) 
 		errVal = v
 	}
 
-	typ := otelType(kind, model != "", isRoot)
+	typ := otelType(kind, modelName != "", isRoot)
 	pt := firstInt(attrs, "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens",
 		"llm.token_count.prompt", "prompt_tokens", "input_tokens")
 	ct := firstInt(attrs, "gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens",
@@ -250,13 +242,20 @@ func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) 
 		"llm.output_messages", "output.value")
 
 	cost := 0.0
-	if typ == "llm" && model != "" {
-		ip, op := priceFor(model)
+	tokenSource := ""
+	if typ == "llm" && modelName != "" {
+		reportedUsage := pt > 0 || ct > 0
+		ip, op := model.PriceFor(modelName)
 		if pt == 0 {
-			pt = estTokens(input)
+			pt = model.EstimateTokens(input)
+			tokenSource = model.TokenEstimated
 		}
 		if ct == 0 {
-			ct = estTokens(output)
+			ct = model.EstimateTokens(output)
+			tokenSource = model.TokenEstimated
+		}
+		if tokenSource == "" && reportedUsage {
+			tokenSource = model.TokenProvider
 		}
 		cost = float64(pt)/1000*ip + float64(ct)/1000*op
 	}
@@ -279,18 +278,19 @@ func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) 
 		metaVal = meta
 	}
 
-	return spanRow{
+	return model.SpanRow{
 		ID:       hex.EncodeToString(sp.GetSpanId()),
 		TraceID:  hex.EncodeToString(sp.GetTraceId()),
-		ParentID: parent, Name: sp.GetName(), Type: typ, Model: model,
+		ParentID: parent, Name: sp.GetName(), Type: typ, Model: modelName,
 		Input: input, Output: output, Error: errVal, Metadata: metaVal,
 		StartMS: start, EndMS: end, LatencyMS: latency,
 		PromptTokens: pt, CompletionTokens: ct, CostUSD: cost, Status: status,
+		TokenSource: tokenSource,
 	}
 }
 
 // handleOTLPTraces implements POST /v1/traces (OTLP/HTTP).
-func handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathProjectID string) {
+func (s *Server) handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathProjectID string) {
 	if r.Method != http.MethodPost {
 		errJSON(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
@@ -343,17 +343,17 @@ func handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathProjectID stri
 		if name == "" {
 			name = r.Header.Get("X-Project-Name")
 		}
-		if projectID, err = projectByName(name); err != nil {
+		if projectID, err = s.projectByName(name); err != nil {
 			errJSON(w, http.StatusInternalServerError, "resolve project: "+err.Error())
 			return
 		}
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	dbMu.Lock()
-	tx, err := db.Begin()
+	s.dbMu.Lock()
+	tx, err := s.DB.Begin()
 	if err != nil {
-		dbMu.Unlock()
+		s.dbMu.Unlock()
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -372,7 +372,7 @@ func handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathProjectID stri
 					row.TraceID = row.ID
 				}
 				if err := insertSpanTx(tx, projectID, row, now); err != nil {
-					dbMu.Unlock()
+					s.dbMu.Unlock()
 					errJSON(w, http.StatusInternalServerError, "span insert: "+err.Error())
 					return
 				}
@@ -382,13 +382,13 @@ func handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathProjectID stri
 	}
 	rollupTraceTx(tx)
 	if err := tx.Commit(); err != nil {
-		dbMu.Unlock()
+		s.dbMu.Unlock()
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	dbMu.Unlock()
+	s.dbMu.Unlock()
 
-	logf("otlp ingest", "project_id", projectID, "spans", inserted)
+	s.logf("otlp ingest", "project_id", projectID, "spans", inserted)
 	writeOTLPResponse(w, ct)
 }
 
