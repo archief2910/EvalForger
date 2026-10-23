@@ -13,3 +13,7 @@ uvicorn.log
 vite.log
 screenshots/
 server-go/evalforge.exe
+*.exe~
+.claude/
+.agents/
+skills-lock.json
