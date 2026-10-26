@@ -41,7 +41,7 @@
     {
       "id": "feat-005",
       "name": "Repository Interfaces (MetadataStore + TelemetryStore)",
-      "description": "Define TelemetryStore and MetadataStore interfaces per OPIK_ALIGNMENT D1. SQLite implementations in internal/repository/sqlite/. The physical split now exists (control.db + telemetry.db), but handlers still issue SQL directly; extracting interfaces is what makes a ClickHouse migration possible without rewriting them.",
+      "description": "Define TelemetryStore and MetadataStore interfaces per OPIK_ALIGNMENT D1. PostgreSQL implementations in internal/repository/postgres/ and DuckDB implementations in internal/repository/duckdb/. The physical split already exists (PostgreSQL control plane + DuckDB telemetry), but handlers still issue SQL directly; extracting interfaces is what makes a ClickHouse migration possible without rewriting them.",
       "dependencies": [
         "feat-001"
       ],
@@ -81,7 +81,7 @@
     {
       "id": "feat-009",
       "name": "Go httptest Test Suite",
-      "description": "Table-driven httptest tests for every handler group against a temp SQLite file. Assert status codes, error bodies, one end-to-end path per resource. At least 80% route coverage. (OPIK_ALIGNMENT D11)",
+      "description": "Table-driven httptest tests for every handler group, each against a private PostgreSQL schema and a temporary DuckDB file. Assert status codes, error bodies, one end-to-end path per resource. At least 80% route coverage. (OPIK_ALIGNMENT D11)",
       "dependencies": [
         "feat-002",
         "feat-005"
@@ -109,6 +109,17 @@
       ],
       "status": "done",
       "evidence": "server-go/internal/api/threads.go + threads_test.go; dual-plane database/{db,legacy,migrate}.go; control+telemetry migrations; thread job kind and worker thread callback; five thread scorers; Conversations/ThreadDetail pages; dashboard conversation metrics. Verified: go test ./... green, smoke 41/41, auth 44/44, MCP 23/23, fault 16/16, load 360/360 traces, browser checks on conversation list/detail/trace filter/evaluate."
+    },
+    {
+      "id": "feat-012",
+      "name": "PostgreSQL Control Plane + DuckDB Telemetry",
+      "description": "Move the control plane from SQLite to PostgreSQL and the telemetry plane from SQLite to DuckDB, keeping the plane boundary and merging results in Go. Transport existing SQLite data once, without losing rows.",
+      "dependencies": [
+        "feat-001",
+        "feat-011"
+      ],
+      "status": "done",
+      "evidence": "server-go/internal/database/{db,import,migrate,legacy}.go + internal/pgbind; migrations per plane; imported 245 spans, 28 feedback, 25 eval runs, 56 threads, 28 thread scores and all control rows into the new engines; go test ./... green; smoke 41/41; auth 44/44; MCP 23/23; fault 16/16; load 360/360 traces."
     }
   ]
 }

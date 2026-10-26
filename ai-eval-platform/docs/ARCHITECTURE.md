@@ -25,13 +25,13 @@ flowchart LR
   end
 
   subgraph core["Application"]
-    API["Go API server<br/><code>server-go/evalforge.exe</code> · :8000<br/>net/http · modernc.org/sqlite (pure Go)"]
+    API["Go API server<br/><code>server-go/evalforge.exe</code> · :8000<br/>net/http · pgx · DuckDB"]
     MCP["MCP server<br/><code>evalforge --mcp</code><br/>stdio JSON-RPC · API client, no DB"]
     WORKER["Python eval worker<br/><code>worker-py/worker.py</code><br/>subprocess, one per experiment"]
   end
 
-  CDB[("Control plane · SQLite WAL<br/><code>data/control.db</code><br/>metadata, datasets, jobs")]
-  TDB[("Data plane · SQLite WAL<br/><code>data/telemetry.db</code><br/>spans, feedback, threads, scores")]
+  CDB[("Control plane · PostgreSQL<br/><code>CONTROL_DB_URL</code> · schema <code>public</code><br/>metadata, datasets, jobs, auth")]
+  TDB[("Data plane · DuckDB<br/><code>data/telemetry.duckdb</code><br/>spans, feedback, threads, scores")]
   LLM["OpenRouter<br/>chat/completions<br/>model: openrouter/free"]
 
   SDK -- "POST /projects/{id}/spans:ingest<br/>(batch of span events)" --> API
@@ -39,26 +39,27 @@ flowchart LR
   BROWSER -- "GET/POST /api/v1/*" --> API
   MCPC -- "JSON-RPC 2.0<br/>initialize · tools/list · tools/call" --> MCP
   MCP -- "HTTP /api/v1/*" --> API
-  API -- "SQL (WAL · write tx + mutex)" --> CDB
-  API -- "SQL (WAL · write tx + mutex)" --> TDB
+  API -- "SQL · ? → $n at the driver" --> CDB
+  API -- "SQL · native ? params" --> TDB
   API -- "exec python worker.py<br/>GO_SERVER + env, hard timeout" --> WORKER
   WORKER -. "GET dataset + scorers<br/>POST worker_callback" .-> API
   WORKER -- "HTTPS, retries + token escalation" --> LLM
 ```
 
-**Runtime topology:** two processes plus two SQLite files. The Go server is the only thing that touches
-either database; the worker talks back over the same public HTTP API a third-party client would use,
-which keeps the worker replaceable. The control plane (`control.db`) holds low-volume relational state;
-the data plane (`telemetry.db`) holds append-heavy traces, feedback, conversations and scores. Handlers
-never join across the two files — they read each plane and merge in Go — so either file can be backed
-up, retained or moved independently.
+**Runtime topology:** two processes plus two storage engines. The Go server is the only thing that
+touches either database; the worker talks back over the same public HTTP API a third-party client would
+use, which keeps the worker replaceable. The control plane (PostgreSQL) holds low-volume relational
+state; the data plane (a DuckDB file) holds append-heavy traces, feedback, conversations and scores.
+Handlers never join across the planes — they read each engine and merge in Go — so each can be backed
+up, retained or replaced independently. This is the MySQL + ClickHouse shape Opik uses, without
+introducing a second server process for telemetry.
 
 | Process | Tech | Port / artifact | Why this choice |
 |---|---|---|---|
-| API server | Go 1.x, stdlib `net/http`, `modernc.org/sqlite` (pure Go, no cgo) | `:8000` (`ADDR`), `server-go/evalforge.exe` | One static binary, no runtime deps, no cgo toolchain on Windows |
+| API server | Go 1.x, stdlib `net/http`, pgx (PostgreSQL), go-duckdb (cgo) | `:8000` (`ADDR`), `server-go/evalforge.exe` | One binary; cgo is the price of a columnar telemetry engine with no server process |
 | Eval worker | Python 3.12, stdlib only (`urllib`, `json`, `concurrent.futures`) | spawned by the server, `worker-py/worker.py` | Scorer/judge code stays in Python without giving the API server an event loop |
 | Frontend | React 19 + Vite, `react-router-dom`, hand-written CSS | `:5173`, proxies `/api` → `:8000` | Fast iteration, tiny bundle, no UI framework |
-| Storage | Two SQLite files in WAL mode, JSON columns for payloads | `data/control.db` + `data/telemetry.db` | independent backup/retention/scaling; WAL lets readers run during a write, and each schema maps 1:1 to Postgres |
+| Storage | PostgreSQL 16 for control, DuckDB for telemetry, JSON columns for payloads | `CONTROL_DB_URL` (+ schema) and `data/telemetry.duckdb` | transactional metadata with online backup; columnar scans over spans; independent retention; one-time SQLite import keeps the local files |
 | Provider | OpenRouter OpenAI-compatible API | `https://openrouter.ai/api/v1` | One key, many models; offline fallback if unset |
 
 ---
@@ -69,7 +70,7 @@ up, retained or moved independently.
 sequenceDiagram
   participant SDK as Python SDK
   participant API as Go API
-  participant DB as Telemetry SQLite
+  participant DB as DuckDB telemetry
 
   SDK->>SDK: start_span() pushes an open span on a stack
   SDK->>SDK: end() pops it, child flushed before parent
@@ -242,8 +243,8 @@ threads idle longer than `THREAD_IDLE_SECONDS`; a new turn reopens them. Convers
 `thread_scores` (separate from per-trace feedback), and `POST /threads/{id}/evaluate` enqueues a durable
 `kind='thread_eval'` job whose callback writes those scores.
 
-Live row counts in the demo databases: `control.db` has 1 project, 9 dataset records, 4 experiments,
-2 prompts, 4 jobs; `telemetry.db` has 245 spans (72 traces), 28 feedback rows, 25 eval runs,
+Live row counts in the transported demo data: PostgreSQL has 1 project, 9 dataset records, 4 experiments,
+2 prompts, 4 jobs; the DuckDB file has 245 spans (72 traces), 28 feedback rows, 25 eval runs,
 56 conversations and 28 conversation scores. The `scorers` table exists but is **empty and unused** —
 the registry is a Go literal (`builtinScorers`).
 
@@ -339,7 +340,7 @@ How faithful is it, honestly:
 | Scorers | deterministic code + LLM judges + autoevals + classifiers | 6 deterministic + 2 LLM judges, provenance-tagged | partial — no custom code scorers, no classifiers |
 | Dataset versioning | versioned, rows may reference a trace | integer `version`, promotion references origin trace | partial — version is a counter, not a snapshot |
 | Ingest protocol | REST insert + OTLP | REST batch + **OTLP/HTTP** (protobuf + JSON) | **faithful** — verified with the real Python OTel SDK |
-| Storage | analytical/columnar + object storage | one SQLite file | far simpler; fine for MVP |
+| Storage | analytical/columnar + object storage | PostgreSQL control + DuckDB telemetry, split and merged in Go | closer; DuckDB is embedded rather than a cluster, and there is no object store |
 | Scale model | queue + worker fleet | durable `jobs` table + one dispatcher, one worker subprocess per eval | partial — survives crashes, not horizontally scalable |
 | Auth / RBAC / multi-tenancy | orgs, roles, service tokens | none (single tenant, localhost) | **major gap** |
 | Metering (bytes + scores) | the billing model | not implemented | gap (commercial, not functional) |
@@ -380,7 +381,8 @@ deliberately simple on storage and enterprise concerns.
    protect it.
 
 ### P2 — the things that make it sellable
-10. **Postgres/ClickHouse target** behind the same SQL shape; SQLite is a demo constraint.
+10. **ClickHouse for telemetry** behind the same merge-in-Go boundary. The control plane already runs on
+    PostgreSQL; DuckDB is the embedded stand-in until span volume justifies a ClickHouse cluster.
 11. **Metering** (ingested span bytes, recorded scores) — the pricing model the market already validates.
 12. **Alerts/monitors** on error rate, p95, and score regressions in production.
 13. **Full OpenTelemetry semantic conventions** — `gen_ai.*`, `llm.*` and OpenInference keys are mapped;
@@ -443,8 +445,9 @@ Result: `ok evalforge` (11 tests: 3 OTLP, 8 auth).
 python scripts/smoke_api.py
 ```
 
-Spawns its own server on a free port with a throw-away `DATA_DIR` and no provider key, then drives
-ingest → traces → feedback → dashboard → datasets → prompts → evaluation → compare.
+Spawns its own server on a free port with a throw-away `DATA_DIR`, a private PostgreSQL schema and no
+provider key, then drives ingest → traces → feedback → dashboard → datasets → prompts → evaluation →
+compare. The schema is dropped afterwards; your demo data is never touched.
 
 Result: **41/41 checks**, demo databases untouched. The run now includes multi-turn ingest,
 conversation list/detail, conversation scoring, evaluation queueing, and callback idempotency.
@@ -566,8 +569,8 @@ Two implementation notes worth keeping:
 
 ### 9.8 What these numbers do **not** prove
 
-- They are single-node SQLite numbers. They say nothing about a multi-tenant deployment, and the queue
-  assumes one writer process.
+- They are single-node numbers against one PostgreSQL instance and one DuckDB file. They say nothing
+  about a multi-tenant deployment, and the queue assumes one dispatcher process.
 - The provider is a free router: LLM-judge scores vary between runs by design (that is why `judge_mode`
   and `no-score` are surfaced instead of coerced to `0.0`).
 - UI verification is scripted in the browser, not a CI Playwright suite; it is evidence, not a

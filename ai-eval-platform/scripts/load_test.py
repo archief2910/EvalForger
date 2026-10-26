@@ -19,6 +19,8 @@ import time
 import urllib.error
 import urllib.request
 
+import _pg as pg
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -26,6 +28,9 @@ except Exception:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 ROOT_DIR = ROOT
+
+
+SCHEMA = None
 
 
 def free_port():
@@ -58,10 +63,14 @@ def request(base, method, path, payload=None, timeout=30):
 
 
 def start_server():
+    global SCHEMA
     data_dir = tempfile.mkdtemp(prefix="aieval-load-")
     port = free_port()
+    SCHEMA = pg.schema("load")
+    pg.drop_schema(SCHEMA)
     env = dict(os.environ)
-    env.update({"DATA_DIR": data_dir, "ADDR": f":{port}", "OPENROUTER_API_KEY": ""})
+    env.update({"DATA_DIR": data_dir, "ADDR": f":{port}", "OPENROUTER_API_KEY": "",
+                "CONTROL_DB_SCHEMA": SCHEMA})
     log_path = os.path.join(data_dir, "server.log")
     logf = open(log_path, "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([server_binary()], cwd=os.path.join(ROOT, "server-go"), env=env,
@@ -217,6 +226,7 @@ def main():
             proc.wait(timeout=10)
         except Exception:
             proc.kill()
+        pg.drop_schema(SCHEMA)
         logf.close()
 
 

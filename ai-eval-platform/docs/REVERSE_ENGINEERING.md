@@ -169,7 +169,7 @@ heuristic produces the score and marks `judge_mode: heuristic_fallback` so resul
 were scored.
 
 ## 3.6 MVP scope (what we build now)
-1. Go + SQLite API server implementing all APIs above (batch span ingest, filtered trace search, trace tree,
+1. Go API server implementing all APIs above (batch span ingest, filtered trace search, trace tree,
    feedback, dashboard aggregates, datasets + trace promotion, scorer registry, async eval runner, experiment
    comparison, prompts), with a Python worker process for eval execution.
 2. React + Vite frontend: Projects, Logs(traces) with filters, Trace viewer (nested spans tree + timeline +
@@ -197,8 +197,8 @@ embedding-similarity scorers, plugin SDK for custom code scorers (we ship config
 ## 3.9 Technical decisions log
 | Decision | Choice | Rationale |
 |---|---|---|
-| Backend | Go (`net/http` + `modernc.org/sqlite`, pure-Go driver) | one static binary, no cgo, no runtime deps; fast enough to sit in front of the ingest path |
-| Storage | SQLite single file, JSON columns | MVP scale; spans queried by trace_id + structured filters |
+| Backend | Go (`net/http`, pgx, go-duckdb) | one binary; DuckDB's cgo cost is accepted for a columnar telemetry plane with no extra service |
+| Storage | PostgreSQL control plane + DuckDB telemetry file, JSON columns | transactional metadata with unique constraints; columnar span scans for dashboards |
 | Frontend | React 19 + Vite, no UI framework | keep bundle small; CSS is original, not a copy of Braintrust's UI |
 | Eval runner | Go dispatches a Python worker process; results return via a worker-callback API | keeps LLM/scorer code in Python without giving the API server an event loop; no external broker needed at MVP scale |
 | LLM access | OpenAI-compatible env config (OpenRouter by default) | works with OpenAI, Together, local vLLM/Ollama; heuristic fallback keeps demo offline |

@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS prompts (
 );
 
 CREATE TABLE IF NOT EXISTS model_prices (
-  model TEXT PRIMARY KEY, input_per_1k REAL, output_per_1k REAL
+  model TEXT PRIMARY KEY, input_per_1k DOUBLE PRECISION, output_per_1k DOUBLE PRECISION
 );
 
 CREATE TABLE IF NOT EXISTS jobs (

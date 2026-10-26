@@ -29,6 +29,8 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+import _pg as pg
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REDIRECT = "http://127.0.0.1:7777/callback"
 
@@ -117,15 +119,22 @@ def pkce():
     return verifier, challenge
 
 
+SCHEMA = None
+
+
 def base_url(port):
     return f"http://localhost:{port}"
 
 
 def start_server():
+    global SCHEMA
     data_dir = tempfile.mkdtemp(prefix="evalforge-auth-")
     port = free_port()
+    SCHEMA = pg.schema("auth")
+    pg.drop_schema(SCHEMA)
     env = dict(os.environ)
     env["DATA_DIR"] = data_dir
+    env["CONTROL_DB_SCHEMA"] = SCHEMA
     env["ADDR"] = f":{port}"
     env["AUTH_MODE"] = "required"
     # Pin the issuer to the origin this test actually talks to; without it the
@@ -159,6 +168,7 @@ def stop_server(proc):
         proc.wait(timeout=10)
     except Exception:
         proc.kill()
+    pg.drop_schema(SCHEMA)
 
 
 def mint_key(base, name, scopes, project_id=None, token=None):

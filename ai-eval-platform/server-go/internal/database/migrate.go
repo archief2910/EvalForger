@@ -17,12 +17,12 @@ import (
 //go:embed migrations/telemetry/*.sql
 var migrationsFS embed.FS
 
-// MigrateControl applies the control-plane migration history.
+// MigrateControl applies the control-plane migration history to PostgreSQL.
 func MigrateControl(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 	return migrateDir(ctx, db, "migrations/control", "control", log)
 }
 
-// MigrateTelemetry applies the telemetry-plane migration history.
+// MigrateTelemetry applies the telemetry-plane migration history to DuckDB.
 func MigrateTelemetry(ctx context.Context, db *sql.DB, log *slog.Logger) error {
 	return migrateDir(ctx, db, "migrations/telemetry", "telemetry", log)
 }
@@ -62,9 +62,13 @@ func migrateDir(ctx context.Context, db *sql.DB, dir, plane string, log *slog.Lo
 		if err != nil {
 			return err
 		}
-		if _, err := tx.ExecContext(ctx, string(body)); err != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("migration %s/%s: %w", plane, version, err)
+		// PostgreSQL prepares one statement per round trip, so a migration file
+		// is executed statement by statement inside a single transaction.
+		for _, stmt := range splitStatements(string(body)) {
+			if _, err := tx.ExecContext(ctx, stmt); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("migration %s/%s: %w", plane, version, err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO schema_migrations(version, applied_at) VALUES (?,?)`,
@@ -84,43 +88,42 @@ func migrateDir(ctx context.Context, db *sql.DB, dir, plane string, log *slog.Lo
 	return nil
 }
 
+// splitStatements breaks a migration file into single statements. Migration
+// files in this repository contain plain DDL: no functions, no dollar quoting,
+// no semicolons inside strings. Line comments are removed first because they
+// may themselves contain a semicolon in prose.
+func splitStatements(body string) []string {
+	var out []string
+	for _, raw := range strings.Split(stripLineComments(body), ";") {
+		if stmt := strings.TrimSpace(raw); stmt != "" {
+			out = append(out, stmt)
+		}
+	}
+	return out
+}
+
+func stripLineComments(body string) string {
+	lines := strings.Split(body, "\n")
+	for i, line := range lines {
+		if idx := strings.Index(line, "--"); idx >= 0 {
+			lines[i] = line[:idx]
+		}
+	}
+	return strings.Join(lines, "\n")
+}
+
 // SeedPrices copies the in-memory fallback table into model_prices so the
 // control database is self-describing for tools that read it directly.
 func SeedPrices(ctx context.Context, db *sql.DB) error {
 	for m, p := range model.DefaultPrices {
 		if _, err := db.ExecContext(ctx,
-			`INSERT OR IGNORE INTO model_prices(model, input_per_1k, output_per_1k) VALUES (?,?,?)`,
-			m, p[0], p[1]); err != nil {
+			`INSERT INTO model_prices(model, input_per_1k, output_per_1k) VALUES (?,?,?)
+			 ON CONFLICT DO NOTHING`, m, p[0], p[1]); err != nil {
 			return err
 		}
 	}
 	_, err := db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO model_prices(model, input_per_1k, output_per_1k) VALUES ('*default*', 0.001, 0.002)`)
-	return err
-}
-
-// EnsureColumn adds a column when it is missing. It exists for databases that
-// predate a migration; new schema changes belong in a migration.
-func EnsureColumn(ctx context.Context, db *sql.DB, table, col, typ string) error {
-	rows, err := db.QueryContext(ctx, "PRAGMA table_info("+table+")")
-	if err != nil {
-		return nil // table does not exist yet; the migration will create it
-	}
-	found := false
-	for rows.Next() {
-		var cid int
-		var name, ctype string
-		var notnull int
-		var dflt interface{}
-		var pk int
-		if rows.Scan(&cid, &name, &ctype, &notnull, &dflt, &pk) == nil && name == col {
-			found = true
-		}
-	}
-	rows.Close()
-	if found {
-		return nil
-	}
-	_, err = db.ExecContext(ctx, "ALTER TABLE "+table+" ADD COLUMN "+col+" "+typ)
+		`INSERT INTO model_prices(model, input_per_1k, output_per_1k) VALUES ('*default*', 0.001, 0.002)
+		 ON CONFLICT DO NOTHING`)
 	return err
 }

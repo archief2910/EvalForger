@@ -19,12 +19,12 @@ If baseline verification is failing, repair that first before adding new scope.
 
 | Component       | Location                  | Tech                                |
 |-----------------|---------------------------|-------------------------------------|
-| API Server      | `server-go/cmd/server` + `server-go/internal/` | Go, net/http, modernc.org/sqlite |
+| API Server      | `server-go/cmd/server` + `server-go/internal/` | Go, net/http, pgx (PostgreSQL), go-duckdb |
 | Eval Worker     | `worker-py/worker.py`     | Python 3.12, stdlib only            |
 | Frontend        | `frontend/`               | React 19 + Vite, hand-written CSS   |
 | SDK sample      | `sdk/sample_client.py`    | Proves the ingestion surface        |
 | Tests           | `scripts/`                | smoke, auth, fault, load, MCP       |
-| Database        | `data/control.db` + `data/telemetry.db` | two SQLite WAL files, embedded migrations per plane |
+| Database        | PostgreSQL (`CONTROL_DB_URL`) + `data/telemetry.duckdb` | control metadata in PG, telemetry in DuckDB, embedded migrations per plane |
 
 ## Working Rules
 

@@ -17,3 +17,8 @@ server-go/evalforge.exe
 .claude/
 .agents/
 skills-lock.json
+
+# DuckDB telemetry files (the control plane lives in PostgreSQL)
+*.duckdb
+*.duckdb.wal
+*.duckdb.tmp

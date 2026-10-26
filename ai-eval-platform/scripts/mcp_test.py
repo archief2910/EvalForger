@@ -23,6 +23,8 @@ import time
 import urllib.error
 import urllib.request
 
+import _pg as pg
+
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -36,6 +38,9 @@ def check(name, ok, detail=""):
     results.append((name, ok, detail))
     print(f"{'PASS' if ok else 'FAIL'}  {name}" + (f"  -- {detail}" if detail else ""))
     return ok
+
+
+SCHEMA = None
 
 
 def free_port():
@@ -68,10 +73,14 @@ def api(base, method, path, payload=None, timeout=30):
 
 
 def start_server():
+    global SCHEMA
     data_dir = tempfile.mkdtemp(prefix="aieval-mcp-")
     port = free_port()
+    SCHEMA = pg.schema("mcp")
+    pg.drop_schema(SCHEMA)
     env = dict(os.environ)
-    env.update({"DATA_DIR": data_dir, "ADDR": f":{port}", "OPENROUTER_API_KEY": ""})
+    env.update({"DATA_DIR": data_dir, "ADDR": f":{port}", "OPENROUTER_API_KEY": "",
+                "CONTROL_DB_SCHEMA": SCHEMA})
     log = open(os.path.join(data_dir, "server.log"), "w", encoding="utf-8", errors="replace")
     proc = subprocess.Popen([server_binary()], cwd=os.path.join(ROOT, "server-go"), env=env,
                             stdout=log, stderr=subprocess.STDOUT, text=True)
@@ -330,6 +339,7 @@ def main():
         if client:
             client.close()
         server.terminate()
+        pg.drop_schema(SCHEMA)
         try:
             server.wait(timeout=10)
         except Exception:

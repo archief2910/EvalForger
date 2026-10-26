@@ -30,13 +30,14 @@ func syncThreadTx(ctx context.Context, tx *sql.Tx, projectID, threadID string, n
 	if threadID == "" {
 		return nil
 	}
-	_, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO threads(
+	_, err := tx.ExecContext(ctx, `INSERT INTO threads(
 			project_id, id, status, started_at_ms, last_activity_ms, ended_at_ms,
 			trace_count, created_at, updated_at)
 		SELECT project_id, thread_id, 'open', MIN(start_ms), MAX(COALESCE(end_ms,start_ms)), NULL,
 			COUNT(DISTINCT trace_id), ?, ?
 		FROM spans WHERE project_id=? AND thread_id=?
-		GROUP BY project_id, thread_id`, now, now, projectID, threadID)
+		GROUP BY project_id, thread_id
+		ON CONFLICT DO NOTHING`, now, now, projectID, threadID)
 	if err != nil {
 		return err
 	}

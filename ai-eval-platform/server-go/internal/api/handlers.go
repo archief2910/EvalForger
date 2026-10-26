@@ -227,7 +227,7 @@ type traceRow struct {
 // A trace's model and cost live on its LLM child spans, not on the root task
 // span, so both are aggregated over the whole trace.
 const traceCostExpr = `(SELECT COALESCE(SUM(c.cost_usd),0) FROM spans c WHERE c.trace_id=s.trace_id)`
-const traceModelsExpr = `(SELECT GROUP_CONCAT(DISTINCT ms.model) FROM spans ms WHERE ms.trace_id=s.trace_id AND ms.model IS NOT NULL AND ms.model<>'')`
+const traceModelsExpr = `(SELECT STRING_AGG(DISTINCT ms.model, ',') FROM spans ms WHERE ms.trace_id=s.trace_id AND ms.model IS NOT NULL AND ms.model<>'')`
 
 func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request, projectID string) {
 	q := r.URL.Query()

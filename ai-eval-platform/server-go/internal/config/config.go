@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -19,22 +20,22 @@ import (
 // Config is the immutable runtime configuration. Load() is the only
 // constructor; callers should pass it by value.
 type Config struct {
-	Addr            string
-	DataDir         string
-	DBPath          string // compatibility alias for the control-plane path
-	ControlDBPath   string
-	TelemetryDBPath string
-	LogLevel        slog.Level
-	AuthMode        string
-	PublicBaseURL   string
-	WorkerPath      string
-	WorkerTimeout   time.Duration
-	JobLease        time.Duration
-	ThreadIdle      time.Duration
-	PythonBin       string
-	LegacyDB        string
-	MCPAPIBase      string
-	MCPAPIKey       string
+	Addr          string
+	DataDir       string
+	ControlURL    string // PostgreSQL DSN for the control plane
+	ControlSchema string // schema inside that database; tests use their own
+	TelemetryPath string // DuckDB file for the telemetry plane
+	LogLevel      slog.Level
+	AuthMode      string
+	PublicBaseURL string
+	WorkerPath    string
+	WorkerTimeout time.Duration
+	JobLease      time.Duration
+	ThreadIdle    time.Duration
+	PythonBin     string
+	LegacyDB      string
+	MCPAPIBase    string
+	MCPAPIKey     string
 
 	// ServerBaseURL is the origin this process is reachable at, derived from
 	// Addr unless overridden. The worker and MCP client use it to call back.
@@ -60,18 +61,11 @@ func Load() (Config, error) {
 		MCPAPIKey:     os.Getenv("MCP_API_KEY"),
 	}
 
-	// Two independent SQLite files. DBPath is retained as the control-plane
-	// alias so older callers and logs keep working.
-	c.ControlDBPath = filepath.Join(c.DataDir, "control.db")
-	c.TelemetryDBPath = filepath.Join(c.DataDir, "telemetry.db")
-	c.DBPath = c.ControlDBPath
-	if v := os.Getenv("CONTROL_DB_PATH"); v != "" {
-		c.ControlDBPath = v
-		c.DBPath = v
-	}
-	if v := os.Getenv("TELEMETRY_DB_PATH"); v != "" {
-		c.TelemetryDBPath = v
-	}
+	// Two engines, matching the plane split: PostgreSQL holds the small,
+	// transactional metadata; DuckDB holds append-heavy telemetry on disk.
+	c.ControlURL = env("CONTROL_DB_URL", DefaultControlURL)
+	c.ControlSchema = env("CONTROL_DB_SCHEMA", "public")
+	c.TelemetryPath = env("TELEMETRY_DB_PATH", filepath.Join(c.DataDir, "telemetry.duckdb"))
 
 	if v := os.Getenv("WORKER_TIMEOUT_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -139,12 +133,27 @@ func (c Config) Validate() error {
 	if c.WorkerPath == "" {
 		return fmt.Errorf("WORKER_PATH must not be empty")
 	}
-	if c.ControlDBPath != "" && c.TelemetryDBPath != "" &&
-		filepath.Clean(c.ControlDBPath) == filepath.Clean(c.TelemetryDBPath) {
-		return fmt.Errorf("CONTROL_DB_PATH and TELEMETRY_DB_PATH must be different files")
+	if c.ControlURL == "" {
+		return fmt.Errorf("CONTROL_DB_URL must not be empty")
+	}
+	if u, err := url.Parse(c.ControlURL); err != nil || (u.Scheme != "postgres" && u.Scheme != "postgresql") {
+		return fmt.Errorf("CONTROL_DB_URL must be a postgres:// DSN, got %q", c.ControlURL)
+	}
+	if !schemaName.MatchString(c.ControlSchema) {
+		return fmt.Errorf("CONTROL_DB_SCHEMA must be a lowercase identifier, got %q", c.ControlSchema)
+	}
+	if strings.TrimSpace(c.TelemetryPath) == "" {
+		return fmt.Errorf("TELEMETRY_DB_PATH must not be empty")
 	}
 	return nil
 }
+
+// DefaultControlURL is the local development database. It points at a loopback
+// PostgreSQL with trust authentication, the same shape as the bundled pgdata
+// directory; a deployment sets CONTROL_DB_URL.
+const DefaultControlURL = "postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable"
+
+var schemaName = regexp.MustCompile(`^[a-z_][a-z0-9_]{0,62}$`)
 
 // AuthRequired reports whether every non-public route needs a credential.
 func (c Config) AuthRequired() bool { return c.AuthMode == "required" }

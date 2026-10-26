@@ -55,8 +55,9 @@ func run(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	// Two independent SQLite files. OpenStores migrates both, adopts the old
-	// single-file layout on first boot and backfills conversation threads.
+	// Two engines: PostgreSQL for control metadata, DuckDB for telemetry.
+	// OpenStores migrates both, imports any pre-existing SQLite data once and
+	// backfills conversation threads.
 	stores, err := database.OpenStores(ctx, cfg, log)
 	if err != nil {
 		return err
@@ -94,7 +95,8 @@ func run(args []string) error {
 	errCh := make(chan error, 1)
 	go func() {
 		log.Info("server listening", "addr", cfg.Addr,
-			"control_db", cfg.ControlDBPath, "telemetry_db", cfg.TelemetryDBPath, "auth", cfg.AuthMode)
+			"control", cfg.ControlURL, "control_schema", cfg.ControlSchema,
+			"telemetry", cfg.TelemetryPath, "auth", cfg.AuthMode)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

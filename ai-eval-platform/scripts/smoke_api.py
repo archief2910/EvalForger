@@ -14,6 +14,8 @@ Exit code 0 = every check passed, 1 = at least one failure.
 import argparse, json, os, shutil, socket, subprocess, sys, tempfile, time
 import urllib.error, urllib.request
 
+import _pg as pg
+
 try:  # Windows consoles often default to cp1252 and choke on non-ascii output
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 except Exception:
@@ -59,6 +61,9 @@ def check(name, ok, detail=""):
     return ok
 
 
+SCHEMA = None
+
+
 def free_port():
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
@@ -74,11 +79,15 @@ def server_binary():
 
 
 def start_server():
-    """Starts a private server on a temp database and waits until it answers."""
+    """Starts a private server on a temp directory and private schema."""
+    global SCHEMA
     data_dir = tempfile.mkdtemp(prefix="aieval-smoke-")
     port = free_port()
+    SCHEMA = pg.schema("smoke")
+    pg.drop_schema(SCHEMA)
     env = dict(os.environ)
     env["DATA_DIR"] = data_dir
+    env["CONTROL_DB_SCHEMA"] = SCHEMA
     env["ADDR"] = f":{port}"
     # keep the run offline: the server only passes through env vars it already
     # has, so an empty key stops .env from enabling real provider calls
@@ -119,6 +128,7 @@ def stop_server(proc, data_dir, verbose=False):
                 tail = f.read()[-3000:]
             if tail.strip():
                 print("\n--- server log ---\n" + tail)
+    pg.drop_schema(SCHEMA)
     shutil.rmtree(data_dir, ignore_errors=True)
 
 

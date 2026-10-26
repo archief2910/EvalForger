@@ -14,9 +14,9 @@ Three docs worth reading first:
 Open [docs/architecture.html](docs/architecture.html) in a browser for the rendered diagram.
 
 ## Stack
-- **API server**: Go (`server-go/`, module `evalforge`) — single static binary, owns the two SQLite databases and the
-  whole `/api/v1` surface (ingest, traces, conversations, dashboard, datasets, prompts, experiments) plus the MCP and
-  OAuth endpoints.
+- **API server**: Go (`server-go/`, module `evalforge`) — one binary, owns the PostgreSQL control plane and the
+  DuckDB telemetry store and the whole `/api/v1` surface (ingest, traces, conversations, dashboard, datasets,
+  prompts, experiments) plus the MCP and OAuth endpoints.
 - **Eval worker**: Python (`worker-py/worker.py`) — the Go server dispatches an eval job to it; the worker
   generates outputs, applies the scorers, and posts results back over the worker-callback API.
 - **Frontend**: React 19 + Vite, original dark UI (`frontend/`), proxies `/api` → `localhost:8000`.
@@ -27,7 +27,8 @@ Open [docs/architecture.html](docs/architecture.html) in a browser for the rende
 server-go/
   cmd/server/main.go        # flags, config, migrate, serve, graceful shutdown
   internal/config/          # typed env config + validation
-  internal/database/        # dual SQLite planes, embedded migrations, legacy import
+  internal/database/        # PG + DuckDB planes, migrations, SQLite import
+  internal/pgbind/          # ? placeholder → $n for PostgreSQL, at the driver
   internal/model/           # domain types, pricing, token estimation
   internal/queue/           # durable claim/lease/heartbeat/retry queue
   internal/worker/          # Python subprocess boundary
@@ -38,20 +39,32 @@ Handlers are methods on `api.Server`; dependencies are constructor-injected. The
 
 ### Control plane and data plane
 
-Storage is deliberately split into two SQLite files:
+Storage is deliberately split, the same shape Opik uses for MySQL + ClickHouse: a transactional
+database for metadata and a columnar file for telemetry.
 
-| File | Owns | Why |
+| Engine | Owns | Why |
 |---|---|---|
-| `data/control.db` | projects, datasets, dataset versions/records, prompts, experiments, scorers, model prices, jobs, API keys/OAuth, feedback definitions | small, relational, backed up with configuration |
-| `data/telemetry.db` | spans, feedback, eval runs, conversations (`threads`), conversation scores | append-heavy, retained/vacuumed/scaled independently |
+| **PostgreSQL** (`CONTROL_DB_URL`, schema `CONTROL_DB_SCHEMA`) | projects, datasets, dataset versions/records, prompts, experiments, scorers, model prices, jobs, API keys/OAuth, feedback definitions | small, relational, transactional; online backup and concurrent writers without a process-wide mutex |
+| **DuckDB** (`TELEMETRY_DB_PATH`, `data/telemetry.duckdb`) | spans, feedback, eval runs, conversations (`threads`), conversation scores | append-heavy, columnar scans for dashboards, backed up as one file, retained independently |
 
-Handlers never join across the files. They query one plane, then merge in Go, so the telemetry file can
-move to cheaper storage or a separate database without rewriting the product surface. An existing
-`data/ai_eval.db` is adopted once: metadata becomes `control.db`, telemetry is imported into
-`telemetry.db`, and every historical trace is backfilled into a one-turn conversation.
+Handlers never join across the planes. They query one engine, then merge in Go, so telemetry can move
+to ClickHouse later without rewriting the product surface. Statements are written once with `?`
+placeholders: DuckDB uses them natively and `internal/pgbind` rewrites them to `$1..$n` at the
+PostgreSQL driver boundary, including inside transactions.
+
+The move off SQLite is automatic and one-time. On first boot the server imports any existing
+`data/ai_eval.db`, `data/telemetry.db` and `data/control.db` it finds (or `LEGACY_DB`): control tables
+land in PostgreSQL, telemetry tables in DuckDB, each row with `ON CONFLICT DO NOTHING`, each file
+recorded in `import_state`. The SQLite files are opened read-only and left on disk, so nothing is lost
+and the import can be retried safely. Every historical trace is then backfilled into a one-turn
+conversation.
 
 ## Run it
 ```bash
+# 0) PostgreSQL 16 with a database and role (local dev: the bundled data/pgdata cluster on :55432)
+#    CONTROL_DB_URL defaults to postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable
+export CONTROL_DB_URL='postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable'
+
 # 1) API server (from ai-eval-platform/server-go)
 cd ai-eval-platform/server-go
 go build -o evalforge.exe ./cmd/server && ./evalforge.exe     # → http://localhost:8000
@@ -228,17 +241,17 @@ python scripts/load_test.py     # concurrent ingest/query benchmark with integri
 python scripts/mcp_test.py      # 23 MCP checks: handshake, tools, reads, writes, eval, errors
 python worker-py/seed.py        # re-seed the demo project (no-op if it already exists)
 ```
-`smoke_api.py` boots its own server instance on a free port with a throw-away `DATA_DIR` and no
-provider key, so it covers ingest → traces → feedback → dashboard → datasets → prompts → eval →
-compare deterministically without touching your demo database. Pass `--base URL` to point it at an
-already-running server instead.
+`smoke_api.py` boots its own server instance on a free port with a throw-away `DATA_DIR` and a private
+PostgreSQL schema, and no provider key, so it covers ingest → traces → feedback → dashboard → datasets
+→ prompts → eval → compare deterministically without touching your demo data. Every harness drops its
+schema on exit; pass `--base URL` to point it at an already-running server instead.
 
 `auth_test.py` starts a second private server with `AUTH_MODE=required` and drives the flow a real MCP
 client would: registration, authorize (form + PKCE), token exchange, a protected MCP call, refresh,
 replay rejection, revocation, and cross-project isolation.
 
 `fault_test.py` hard-kills the server mid-evaluation (`taskkill /T /F`), restarts it on the same
-database and asserts the experiment finishes with no duplicated runs; it also proves a hung worker is
+schema and DuckDB file and asserts the experiment finishes with no duplicated runs; it also proves a hung worker is
 killed at `WORKER_TIMEOUT_SECONDS` and a crashed worker is retried exactly once. `load_test.py`
 reports spans/second and p50/p95 for ingest, trace list and dashboard, and fails if any span is lost
 or duplicated.
@@ -247,9 +260,11 @@ Environment knobs for the server/worker split:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATA_DIR` | `../data` | base directory for both SQLite files |
-| `CONTROL_DB_PATH` | `$DATA_DIR/control.db` | control-plane SQLite file (metadata, must differ from telemetry) |
-| `TELEMETRY_DB_PATH` | `$DATA_DIR/telemetry.db` | data-plane SQLite file (traces, conversations, scores) |
+| `DATA_DIR` | `../data` | base directory for the telemetry file, logs and one-time imports |
+| `CONTROL_DB_URL` | `postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable` | PostgreSQL DSN for the control plane |
+| `CONTROL_DB_SCHEMA` | `public` | schema inside that database (harnesses and tests pin a private one) |
+| `TELEMETRY_DB_PATH` | `$DATA_DIR/telemetry.duckdb` | DuckDB file for traces, feedback, conversations, scores |
+| `LEGACY_DB` | – | extra SQLite file to import once, on top of the conventional names in `DATA_DIR` |
 | `THREAD_IDLE_SECONDS` | `1800` | idle conversations close after this many seconds; new activity reopens them |
 | `ADDR` | `:8000` | listen address |
 | `AUTH_MODE` | `off` | `required` enforces API keys / OAuth tokens on every non-public route |

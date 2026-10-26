@@ -57,13 +57,32 @@ test suite.
 
 #### Conversations & control/data plane split (feat-011)
 
-- [x] **Two SQLite planes.** `data/control.db` owns projects, datasets/versions/records, prompts,
-      experiments, scorers, model prices, jobs, API keys/OAuth and feedback definitions.
-      `data/telemetry.db` owns spans, feedback, eval_runs, threads and thread_scores. Handlers
-      read one plane and merge in Go; there are no cross-file write transactions.
-- [x] **Upgrade path.** A pre-split `data/ai_eval.db` is adopted once: copied to `control.db`,
-      telemetry imported into `telemetry.db`, legacy telemetry tables dropped from control, and
-      every historical trace backfilled into a one-turn conversation. The old file is left intact.
+- [x] **Two planes** (originally two SQLite files; superseded by the PostgreSQL + DuckDB migration
+      below). The control plane owns projects, datasets/versions/records, prompts, experiments,
+      scorers, model prices, jobs, API keys/OAuth and feedback definitions; the telemetry plane owns
+      spans, feedback, eval_runs, threads and thread_scores. Handlers read one plane and merge in Go;
+      there are no cross-plane write transactions.
+- [x] **Upgrade path.** Historical SQLite data is transported once into the new engines and every
+      historical trace is backfilled into a one-turn conversation. The SQLite files are left intact.
+
+#### Storage engines: PostgreSQL + DuckDB (feat-012)
+
+- [x] **Control plane on PostgreSQL.** `CONTROL_DB_URL` + `CONTROL_DB_SCHEMA`, pgx driver, statements
+      keep `?` and `internal/pgbind` rewrites them to `$1..$n` at the driver boundary (including inside
+      transactions). Migrations are applied statement-by-statement in one transaction; a private
+      schema per test/harness run is created and dropped automatically.
+- [x] **Telemetry on DuckDB.** `TELEMETRY_DB_PATH` (default `data/telemetry.duckdb`), one connector and
+      a bounded pool, columnar scans for dashboards, BIGINT millisecond columns (SQLite's INTEGER was
+      dynamically typed and hid the overflow).
+- [x] **One-time transport.** `internal/database/import.go` reads `ai_eval.db`, `telemetry.db` and
+      `control.db` (or `LEGACY_DB`) read-only, routes the whitelisted tables per plane, inserts with
+      `ON CONFLICT DO NOTHING`, and records each file in `import_state`. Verified against the demo data:
+      245 spans, 28 feedback, 25 eval runs, 56 conversations, 28 scores, plus all control rows.
+- [x] **Harness isolation.** Since PostgreSQL is not inside `DATA_DIR`, each Go test and each Python
+      harness pins its own schema; `scripts/_pg.py` creates/drops it, and `fault_test.py` inspects job
+      rows through psql while the server is deliberately down.
+- [x] **Verified:** `go test ./...`, smoke **41/41**, auth **44/44**, MCP **23/23**, fault **16/16**,
+      load **PASS** (360/360 traces, 0 errors), each against PostgreSQL + DuckDB.
 - [x] **Thread identity and lifecycle.** Native ingest and OTLP accept an explicit `thread_id`;
       absent it, the trace id becomes a one-turn thread, so every trace belongs to a conversation.
       Threads are `open`/`closed`, rebuilt after each ingest, closed by an idle sweeper

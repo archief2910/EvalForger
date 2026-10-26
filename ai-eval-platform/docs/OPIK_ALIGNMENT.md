@@ -27,7 +27,10 @@ adapting*, and *decisions to reject at our scale* — each with the idiomatic Go
 Telemetry (traces, spans, feedback scores) is append-only, huge, and needs columnar scans for dashboards. Forcing both
 through one engine is why every "just use Postgres for everything" observability product hits a wall around 10⁷ spans.
 
-We currently force both through one SQLite file. That is the correct trade at demo scale and the wrong trade forever.
+We implemented that split: the control plane now runs on PostgreSQL (small, transactional, unique constraints) and
+telemetry on DuckDB (columnar, append-heavy, one file). Statements stay single-spelled with `?`; a driver-level shim
+rewrites them to `$1..$n` for PostgreSQL. The embedded DuckDB is the stand-in for ClickHouse — same boundary, no
+cluster to operate yet.
 
 ---
 
@@ -85,55 +88,43 @@ implementation path, not code.
 | Load benchmark with integrity assertions | `python scripts/load_test.py` → 1,080 spans in 1.4–2.8 s (390–770 spans/s), read p95 ~33 ms, 0 errors, 0 duplicates |
 | UI end-to-end (feedback → promote → eval → compare) | driven in a browser; dataset v3→v4, experiment completed with 7 runs, job `done attempts=1` |
 | MCP server (`--mcp`): 11 tools over stdio JSON-RPC, API-client design | `server-go/mcp.go`; `scripts/mcp_test.py` **23/23**; also driven by the official `mcp` Python SDK |
-| Control/data plane split (`control.db` + `telemetry.db`) and first-class conversations with thread-level scoring | `internal/database/{db,legacy,migrate}.go`, `internal/api/threads.go`, `threads_test.go`; smoke **41/41**, fault **16/16** |
+| Control/data plane split (PostgreSQL + DuckDB), one-time SQLite import, and first-class conversations with thread-level scoring | `internal/database/{db,import,migrate,legacy}.go`, `internal/pgbind`, `internal/api/threads.go`; smoke **41/41**, fault **16/16**, auth **44/44**, MCP **23/23** |
 | Documented corrections and roadmap | this file |
 
 ---
 
 ## 4. Decisions
 
-### D1 — Split metadata from telemetry, but keep one SQLite file for now
+### D1 — Split metadata from telemetry: PostgreSQL + DuckDB (implemented)
 
 **Opik:** MySQL for metadata, ClickHouse for traces/spans.
-**Us:** one SQLite file for both.
+**Us (before):** two SQLite files — the right boundary, the wrong engines.
 
-**Decision: adopt the boundary, not the hardware.** Define two repository interfaces — `MetadataStore` and
-`TelemetryStore` — even while both are backed by the same `*sql.DB`. The moment a real deployment needs it, only
-`TelemetryStore` changes to ClickHouse; no handler or service changes.
+**Decision: adopt the boundary *and* the engines, embedded where possible.** The control plane is PostgreSQL
+(`CONTROL_DB_URL`, schema `CONTROL_DB_SCHEMA`); telemetry is a DuckDB file (`TELEMETRY_DB_PATH`). Handlers still
+issue SQL directly and merge planes in Go; the split is physical, so each engine has its own migrations, backup and
+retention path.
 
-```go
-// internal/repository/repository.go
-type TelemetryStore interface {
-    Ingest(ctx context.Context, projectID string, spans []model.Span) (IngestResult, error)
-    ListTraces(ctx context.Context, f TraceFilter) (TracePage, error)
-    GetSpanTree(ctx context.Context, projectID, traceID string) ([]model.Span, error)
-    Dashboard(ctx context.Context, projectID string, since time.Time) (model.Dashboard, error)
-}
+**Why DuckDB rather than ClickHouse now:** the boundary is what buys the option. DuckDB is columnar, scans spans for
+dashboards without loading an index per row, and is a single file — no extra service for a laptop or a small
+deployment. When span volume justifies a cluster, only the telemetry plane changes: the API surface, the merge logic
+and the SQL shape stay.
 
-type MetadataStore interface {
-    Projects() ProjectRepo
-    Datasets() DatasetRepo   // includes Versions()
-    Experiments() ExperimentRepo
-    Prompts() PromptRepo     // append-only versions
-    Feedback() FeedbackRepo  // definition registry
-    Jobs() JobRepo
-}
-```
+**One spelling of SQL.** Every statement uses `?`. DuckDB accepts it natively; `internal/pgbind` wraps the pgx driver
+and rewrites `?` → `$1..$n` at `Prepare`, `ExecContext`, `QueryContext` and inside `driver.Tx`, skipping literals,
+quoted identifiers and comments. That keeps transactions and the dynamic filter builders honest without maintaining
+two copies of ninety statements.
 
-**When to actually migrate:** spans > 5×10⁷, p95 `ListTraces` > 300 ms with indexes warm, or write throughput
-saturating the single writer. Document the number; don't migrate on vibes.
+**Data migration is part of the feature.** `internal/database/import.go` reads any `ai_eval.db`, `telemetry.db`,
+`control.db` (or `LEGACY_DB`) once, routes each whitelisted table to its plane, inserts with `ON CONFLICT DO NOTHING`
+and records the file in `import_state`. SQLite files are opened read-only and retained. Booting this build against the
+previous `data/` directory transported 245 spans, 28 feedback rows, 25 eval runs, 56 conversations, 28 scores and
+the full metadata set in one run.
 
-**Go detail:** open SQLite with WAL and a *read* pool, not `SetMaxOpenConns(1)`:
-
-```go
-dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)" +
-    "&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
-db.SetMaxOpenConns(runtime.NumCPU())   // WAL: readers never block the writer
-db.SetMaxIdleConns(runtime.NumCPU())
-```
-
-WAL is what makes the global `dbMu` unnecessary for reads. Keep one writer connection only if you keep the mutex;
-prefer `BEGIN IMMEDIATE` for write transactions and drop the mutex entirely.
+**Costs, stated plainly:** DuckDB needs cgo (gcc on Windows), allows one writer process per file, and is not a
+network service — a second API instance needs its own file or a different telemetry backend. PostgreSQL must be
+reachable before the server starts; there is no embedded fallback by design, because silently falling back is how
+two divergent schemas happen.
 
 ### D2 — Ingest speaks OTLP, not a bespoke schema
 
@@ -262,7 +253,7 @@ up-only here); forward-only is fine when every release ships a migration.
 **Opik:** JUnit integration tests against MySQL/ClickHouse containers.
 **Us:** one out-of-band Python smoke script, plus a Go repo with no `_test.go`.
 
-**Decision:** `httptest`-based handler tests in Go (`internal/api/*_test.go`) using a temp SQLite file, plus the
+**Decision:** `httptest`-based handler tests in Go (`internal/api/*_test.go`) using a private PostgreSQL schema and a temporary DuckDB file per test, plus the
 existing black-box smoke script for cross-process checks. Testcontainers only becomes relevant when Postgres arrives.
 
 ### D13 — Expose the platform to agents over MCP (implemented)
@@ -285,9 +276,9 @@ Why this shape, in Go terms:
 - **Stdio transport, newline-delimited JSON-RPC 2.0.** The host spawns the process; stdout carries
   protocol messages, logs go to stderr (`log/slog` elsewhere is unaffected). No HTTP server, no
   websocket, no SSE — one `bufio.Scanner` over `os.Stdin`.
-- **The MCP process is an API client.** It does not open the database. That keeps a single writer for
-  SQLite (D6), makes the tool layer testable without fixtures, and lets an editor on a laptop drive a
-  remote deployment by changing `MCP_API_BASE`.
+- **The MCP process is an API client.** It does not open either database. That keeps one writer process
+  for the control plane and one for the DuckDB file (D6), makes the tool layer testable without fixtures,
+  and lets an editor on a laptop drive a remote deployment by changing `MCP_API_BASE`.
 - **11 tools, read-first with two writes** (`add_feedback`, `run_evaluation`) so an agent can inspect
   traces, datasets, dashboards and experiments, then act. `project_name` is accepted anywhere an id is,
   so a model can say "Demo Support Agent" instead of resolving ids first.
@@ -323,7 +314,7 @@ token and per-tool scopes; evidence is `scripts/auth_test.py` (44/44).
 | Reactor `Mono`/`Flux` pipelines in services | Go's `context` + explicit errors are simpler; reactive composition is what you do when threads are expensive |
 | Java DAO per table with annotation mappers | `database/sql` + small typed structs is the idiomatic equivalent; don't build an ORM |
 | 40 JAX-RS resources before the core loop is correct | Breadth without depth; annotation queues and automation rules are meaningless without reliable ingest |
-| Redisson distributed locks | Single binary; SQLite transactions + unique constraints are the lock |
+| Redisson distributed locks | Single dispatcher; PostgreSQL transactions + unique constraints are the lock |
 | Base64-ing OTel ids in Redis as an id-map | We can key spans by the OTel span id directly; no mapping table needed |
 | Separate Python backend for guardrails | We already have a Python worker; another service is a second deploy for one feature |
 
@@ -344,7 +335,8 @@ server-go/
     model/                        # Span, Trace, Dataset, Experiment, Prompt, Job
     repository/
       repository.go               # interfaces (D1)
-      sqlite/                     # one file per aggregate
+      postgres/                   # one store per aggregate (control plane)
+      duckdb/                     # telemetry plane: spans, feedback, eval runs
     service/
       ingest.go                   # native + OTLP normalisation, cost, tree rollup
       eval.go                     # experiment lifecycle, dispatch
@@ -419,7 +411,7 @@ Ordered by *what makes the product real*, not by what is fun to build. Each item
 
 | # | Gap | Acceptance criterion |
 |---|---|---|
-| 10 | Single-node SQLite | Telemetry store swappable to ClickHouse behind `TelemetryStore`; migration documented and benchmarked |
+| 10 | Embedded DuckDB telemetry | ClickHouse behind the same plane boundary; migration documented and benchmarked |
 | 11 | No retention | Per-project retention rule deletes spans older than N days on a schedule; dashboard reflects it |
 | 12 | No online evaluation | A rule "on every new trace in project X, run scorer Y" produces scores without a human |
 | 13 | No alerting | A monitor on `error_rate > 5%` for 15 min fires once, not per span |

@@ -95,7 +95,7 @@
   <!-- ── go api ── -->
   <rect class="boxgo" x="350" y="80" width="350" height="560" rx="12"/>
   <text class="t title" x="368" y="108">Go API server — :8000</text>
-  <text class="m body" x="368" y="126">net/http · modernc.org/sqlite (pure Go, no cgo)</text>
+  <text class="m body" x="368" y="126">net/http · pgx · go-duckdb</text>
 
   <rect class="box2" x="366" y="140" width="318" height="40" rx="7"/>
   <text class="t body" x="380" y="156">routing /api/v1/* · request-id · access log · CORS</text>
@@ -123,21 +123,21 @@
   <text class="t body" x="380" y="420">worker callback</text>
   <text class="m lbl" x="380" y="435">delete + insert runs in a tx (idempotent)</text>
 
-  <text class="m body" x="368" y="478">two SQLite WAL files · 8-conn pools · write mutexes</text>
+  <text class="m body" x="368" y="478">PostgreSQL control plane + DuckDB telemetry · merged in Go</text>
   <text class="m body" x="368" y="498">.env loaded at boot · key never logged</text>
   <text class="m body" x="368" y="518">GO_SERVER handed to the worker (non-default port safe)</text>
   <text class="m body" x="368" y="546" style="fill:#8b93a7">AUTH_MODE=required: API keys + OAuth PKCE · project-scoped keys</text>
 
-  <!-- ── sqlite ── -->
+  <!-- ── storage ── -->
   <rect class="boxdb" x="760" y="80" width="230" height="212" rx="10"/>
-  <text class="t title" x="776" y="106">SQLite · two planes</text>
-  <text class="m body" x="776" y="123">control.db · telemetry.db</text>
-  <text class="m lbl" x="776" y="147">control: projects datasets prompts</text>
+  <text class="t title" x="776" y="106">PostgreSQL + DuckDB</text>
+  <text class="m body" x="776" y="123">CONTROL_DB_URL · telemetry.duckdb</text>
+  <text class="m lbl" x="776" y="147">control (PG): projects datasets prompts</text>
   <text class="m lbl" x="776" y="163">experiments jobs scorers keys</text>
   <text class="m lbl" x="776" y="179">telemetry: spans feedback eval_runs</text>
   <text class="m lbl" x="776" y="195">threads thread_scores</text>
   <text class="m lbl" x="776" y="211">merged in Go — no cross-file joins</text>
-  <text class="m lbl" x="776" y="227">legacy ai_eval.db adopted once</text>
+  <text class="m lbl" x="776" y="227">legacy SQLite imported once</text>
   <text class="m lbl" x="776" y="252">journal: WAL · busy_timeout 5000</text>
   <text class="m lbl" x="776" y="267">JSON columns for every payload</text>
   <text class="m lbl" x="776" y="282">root span == trace row</text>
@@ -222,7 +222,7 @@
 </svg>
 
 <footer>
-  Ports: API <code>:8000</code> · UI <code>:5173</code>. Storage: one SQLite file. Eval execution: Python subprocess
+  Ports: API <code>:8000</code> · UI <code>:5173</code>. Storage: PostgreSQL control plane + DuckDB telemetry. Eval execution: Python subprocess
   returning over the public API. Provider: OpenRouter, model pinned to <code>openrouter/free</code>.
   Full detail and gap analysis: <code>docs/ARCHITECTURE.md</code>.
 </footer>
