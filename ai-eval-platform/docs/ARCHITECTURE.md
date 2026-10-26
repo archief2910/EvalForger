@@ -30,7 +30,8 @@ flowchart LR
     WORKER["Python eval worker<br/><code>worker-py/worker.py</code><br/>subprocess, one per experiment"]
   end
 
-  DB[("SQLite · WAL<br/><code>data/ai_eval.db</code><br/>11 tables")]
+  CDB[("Control plane · SQLite WAL<br/><code>data/control.db</code><br/>metadata, datasets, jobs")]
+  TDB[("Data plane · SQLite WAL<br/><code>data/telemetry.db</code><br/>spans, feedback, threads, scores")]
   LLM["OpenRouter<br/>chat/completions<br/>model: openrouter/free"]
 
   SDK -- "POST /projects/{id}/spans:ingest<br/>(batch of span events)" --> API
@@ -38,22 +39,26 @@ flowchart LR
   BROWSER -- "GET/POST /api/v1/*" --> API
   MCPC -- "JSON-RPC 2.0<br/>initialize · tools/list · tools/call" --> MCP
   MCP -- "HTTP /api/v1/*" --> API
-  API -- "SQL (WAL · write tx + mutex)" --> DB
+  API -- "SQL (WAL · write tx + mutex)" --> CDB
+  API -- "SQL (WAL · write tx + mutex)" --> TDB
   API -- "exec python worker.py<br/>GO_SERVER + env, hard timeout" --> WORKER
   WORKER -. "GET dataset + scorers<br/>POST worker_callback" .-> API
   WORKER -- "HTTPS, retries + token escalation" --> LLM
 ```
 
-**Runtime topology:** two processes plus a file. The Go server is the only thing that touches the
-database; the worker talks back over the same public HTTP API a third-party client would use, which
-keeps the worker replaceable.
+**Runtime topology:** two processes plus two SQLite files. The Go server is the only thing that touches
+either database; the worker talks back over the same public HTTP API a third-party client would use,
+which keeps the worker replaceable. The control plane (`control.db`) holds low-volume relational state;
+the data plane (`telemetry.db`) holds append-heavy traces, feedback, conversations and scores. Handlers
+never join across the two files — they read each plane and merge in Go — so either file can be backed
+up, retained or moved independently.
 
 | Process | Tech | Port / artifact | Why this choice |
 |---|---|---|---|
 | API server | Go 1.x, stdlib `net/http`, `modernc.org/sqlite` (pure Go, no cgo) | `:8000` (`ADDR`), `server-go/evalforge.exe` | One static binary, no runtime deps, no cgo toolchain on Windows |
 | Eval worker | Python 3.12, stdlib only (`urllib`, `json`, `concurrent.futures`) | spawned by the server, `worker-py/worker.py` | Scorer/judge code stays in Python without giving the API server an event loop |
 | Frontend | React 19 + Vite, `react-router-dom`, hand-written CSS | `:5173`, proxies `/api` → `:8000` | Fast iteration, tiny bundle, no UI framework |
-| Storage | SQLite in WAL mode, JSON columns for payloads | `data/ai_eval.db` | MVP scale; WAL lets readers run during a write, and the schema maps 1:1 to Postgres |
+| Storage | Two SQLite files in WAL mode, JSON columns for payloads | `data/control.db` + `data/telemetry.db` | independent backup/retention/scaling; WAL lets readers run during a write, and each schema maps 1:1 to Postgres |
 | Provider | OpenRouter OpenAI-compatible API | `https://openrouter.ai/api/v1` | One key, many models; offline fallback if unset |
 
 ---
@@ -64,15 +69,17 @@ keeps the worker replaceable.
 sequenceDiagram
   participant SDK as Python SDK
   participant API as Go API
-  participant DB as SQLite
+  participant DB as Telemetry SQLite
 
   SDK->>SDK: start_span() pushes an open span on a stack
   SDK->>SDK: end() pops it, child flushed before parent
   SDK->>API: POST /projects/{id}/spans:ingest {events: [...]}
   API->>API: pass 1 — assign ids, resolve trace_id<br/>(in-batch parent map, then DB lookup for older parents)
+  API->>API: resolve thread_id (explicit, else trace fallback)
   API->>DB: BEGIN
   API->>DB: INSERT OR REPLACE spans (idempotent retries)
   API->>DB: roll root latency up from children<br/>+ propagate child errors to the root
+  API->>DB: sync thread row (turn count, first/last activity)
   API->>DB: COMMIT
   API-->>SDK: {inserted: n, traces_created: m}
 ```
@@ -147,21 +154,25 @@ like a real regression.
 
 ```mermaid
 erDiagram
-  projects ||--o{ spans : "owns"
-  projects ||--o{ datasets : "owns"
-  projects ||--o{ prompts : "owns"
-  projects ||--o{ experiments : "owns"
+  projects ||--o{ spans : "owns (telemetry)"
+  projects ||--o{ datasets : "owns (control)"
+  projects ||--o{ prompts : "owns (control)"
+  projects ||--o{ experiments : "owns (control)"
+  projects ||--o{ threads : "owns (telemetry)"
   datasets ||--o{ dataset_records : "contains"
-  experiments ||--o{ eval_runs : "records"
-  experiments ||--o| jobs : "executed by"
+  experiments ||--o{ eval_runs : "records (telemetry)"
+  experiments ||--o| jobs : "executed by (control)"
   spans ||--o{ feedback : "reviewed by"
   spans ||--o{ spans : "parent_id (self-join tree)"
+  threads ||--o{ spans : "groups via thread_id"
+  threads ||--o{ thread_scores : "scored by"
 
   projects { text id PK
              text name
              text description }
   spans { text id PK
           text trace_id
+          text thread_id
           text parent_id
           text name
           text type
@@ -177,6 +188,21 @@ erDiagram
           int completion_tokens
           real cost_usd
           text status }
+  threads { text project_id PK
+            text id PK
+            text status "open | closed"
+            int started_at_ms
+            int last_activity_ms
+            int ended_at_ms
+            int trace_count }
+  thread_scores { text id PK
+                  text thread_id FK
+                  text name
+                  real score
+                  text rationale
+                  text source
+                  text judge_mode
+                  text job_id }
   datasets { text id PK
              int version }
   dataset_records { text id PK
@@ -208,9 +234,18 @@ A **trace is not its own table**: the root span (`parent_id IS NULL`) *is* the t
 trace-level model/cost are aggregated from child spans at query time. This is what makes
 production→eval promotion cheap, and it is also the main thing that would need denormalising at scale.
 
-Live row counts in the demo database: 119 spans (36 traces), 9 dataset records, 25 eval runs,
-4 experiments, 2 prompts, 1 job. The `scorers` table exists but is **empty and unused** — the registry
-is a Go literal (`builtinScorers`).
+A **conversation is a thread row** rebuilt from its spans after every ingest: `started_at_ms` is the
+first turn, `last_activity_ms` the latest end, `trace_count` the number of distinct traces (turns).
+Turns are linked by `spans.thread_id`. Native ingest and OTLP accept an explicit `thread_id`; when it is
+absent the trace id becomes a one-turn conversation, so every trace is addressable. The sweeper closes
+threads idle longer than `THREAD_IDLE_SECONDS`; a new turn reopens them. Conversation scores live in
+`thread_scores` (separate from per-trace feedback), and `POST /threads/{id}/evaluate` enqueues a durable
+`kind='thread_eval'` job whose callback writes those scores.
+
+Live row counts in the demo databases: `control.db` has 1 project, 9 dataset records, 4 experiments,
+2 prompts, 4 jobs; `telemetry.db` has 245 spans (72 traces), 28 feedback rows, 25 eval runs,
+56 conversations and 28 conversation scores. The `scorers` table exists but is **empty and unused** —
+the registry is a Go literal (`builtinScorers`).
 
 `jobs` is the only table that is *mutable control state*: it is claimed with a single conditional
 `UPDATE`, leased with a heartbeat, and repaired by a reaper. Everything else is append-mostly.
@@ -224,12 +259,13 @@ is a Go literal (`builtinScorers`).
 | Projects | `GET/POST /projects`, `GET /projects/{id}` | filtered to the credential's project scope |
 | Ingest | `POST /projects/{id}/spans:ingest` | our batch format, idempotent by span id (`INSERT OR REPLACE`) |
 | Ingest (OTLP) | `POST /v1/traces` (also `/api/v1/projects/{id}/otel/v1/traces`) | OTLP/HTTP, **protobuf and JSON**; project from the `project-name` header (auto-created); empty export = `200` no-op; maps `gen_ai.*`, `llm.*`, OpenInference attributes |
-| Observe | `GET /projects/{id}/traces` (+ filters: status, model, search, min_latency, min_cost, has_feedback, sort), `GET /projects/{id}/traces/{tid}`, `POST …/feedback` | trace list aggregates model + cost across the trace |
-| Dashboard | `GET /projects/{id}/dashboard?hours=` | count, error rate, p50/p95/p99, tokens, cost, model split, bucketed series |
+| Observe | `GET /projects/{id}/traces` (+ filters: status, model, search, min_latency, min_cost, has_feedback, thread_id, sort), `GET /projects/{id}/traces/{tid}`, `POST …/feedback` | trace list aggregates model + cost across the trace |
+| Conversations | `GET /projects/{id}/threads` (+ status/search/sort), `GET /projects/{id}/threads/{id}`, `POST …/{id}/close`, `POST …/{id}/open`, `GET/POST …/{id}/scores`, `POST …/{id}/evaluate` | turns, score summary, evaluation history, manual and worker scores |
+| Dashboard | `GET /projects/{id}/dashboard?hours=` | count, error rate, p50/p95/p99, tokens, cost, model split, bucketed series, conversation counts/averages |
 | Datasets | `GET/POST /projects/{id}/datasets`, `GET /datasets/{id}`, `POST /datasets/{id}/records` (object **or** array), `POST /datasets/{id}/records:from_trace` | promotion copies root input + your corrected `expected` + `metadata.origin_trace_id` |
 | Evaluate | `GET /scorers`, `POST /projects/{id}/evaluations`, `GET /projects/{id}/experiments`, `GET /experiments/{id}`, `GET /experiments/{id}/compare?baseline_id=` | comparison aligns cases by `input` |
 | Prompts | `GET/POST /projects/{id}/prompts` | versioned, **not yet used by evals** |
-| Internal | `POST /worker_callback/{experiment_id}` | only the worker calls this |
+| Internal | `POST /worker_callback/{experiment_id}`, `POST /worker_callback/thread/{job_id}` | only the worker calls these; both are idempotent |
 
 ---
 
@@ -410,7 +446,8 @@ python scripts/smoke_api.py
 Spawns its own server on a free port with a throw-away `DATA_DIR` and no provider key, then drives
 ingest → traces → feedback → dashboard → datasets → prompts → evaluation → compare.
 
-Result: **31/31 checks**, demo database untouched.
+Result: **41/41 checks**, demo databases untouched. The run now includes multi-turn ingest,
+conversation list/detail, conversation scoring, evaluation queueing, and callback idempotency.
 
 ### 9.3 Fault injection — does it survive failure?
 

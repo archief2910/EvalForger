@@ -90,6 +90,51 @@ func (c *Client) Run(parent context.Context, req Request) Outcome {
 	}
 }
 
+// RunThread executes one conversation-scoring worker run.
+func (c *Client) RunThread(parent context.Context, req ThreadRequest) Outcome {
+	ctx, cancel := context.WithTimeout(parent, c.Timeout)
+	defer cancel()
+
+	args := []string{
+		c.ScriptPath,
+		"--thread-id", req.ThreadID,
+		"--job-id", req.JobID,
+		"--project-id", req.ProjectID,
+		"--scorers", strings.Join(req.ScorerNames, ","),
+	}
+	cmd := exec.CommandContext(ctx, c.Python, args...)
+	cmd.Env = workerEnv(c.BaseURL, c.InternalToken)
+	out, err := cmd.CombinedOutput()
+	tail := string(out)
+	if len(tail) > 4000 {
+		tail = tail[len(tail)-4000:]
+	}
+
+	switch {
+	case parent.Err() != nil:
+		return Outcome{Diagnostic: "released on shutdown", Released: true}
+	case ctx.Err() == context.DeadlineExceeded:
+		return Outcome{Diagnostic: fmt.Sprintf("worker timed out after %s", c.Timeout), TimedOut: true}
+	case err != nil:
+		c.Log.Warn("thread worker failed", "thread_id", req.ThreadID, "err", err, "output", tail)
+		if strings.TrimSpace(tail) == "" {
+			tail = err.Error()
+		}
+		return Outcome{Diagnostic: tail}
+	default:
+		c.Log.Info("thread worker finished", "thread_id", req.ThreadID, "output", tail)
+		return Outcome{}
+	}
+}
+
+// ThreadRequest describes one conversation evaluation.
+type ThreadRequest struct {
+	JobID       string
+	ProjectID   string
+	ThreadID    string
+	ScorerNames []string
+}
+
 // workerEnv returns the process environment with GO_SERVER pointed at this
 // server, so a non-default ADDR (or a second instance) still reports back here.
 // The internal token is injected last so an inherited value cannot override it.

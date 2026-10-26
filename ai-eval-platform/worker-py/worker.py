@@ -266,6 +266,184 @@ def run_scorer(name, kind, config, sinput, output, expected):
     return {"name": name, "score": round(float(s), 4), "rationale": r, "judge_mode": mode}
 
 
+# ---------------- thread (conversation) scorers ----------------
+
+THREAD_SCORERS = [
+    "thread_completion", "thread_error_free", "thread_turn_consistency",
+    "thread_coherence_judge", "thread_context_retention_judge",
+]
+
+
+def _text(v):
+    if v is None:
+        return ""
+    return v if isinstance(v, str) else json.dumps(v, sort_keys=True, ensure_ascii=False)
+
+
+def _words(v):
+    return set(re.findall(r"\w+", _text(v).lower()))
+
+
+def _jaccard(a, b):
+    if not a and not b:
+        return 1.0
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def _turn_completed(turn):
+    return turn.get("error") is None and turn.get("output") is not None
+
+
+def thread_completion(turns):
+    if not turns:
+        return 0.0
+    return sum(1 for t in turns if _turn_completed(t)) / len(turns)
+
+
+def thread_error_free(turns):
+    if not turns:
+        return 0.0
+    return sum(1 for t in turns if t.get("status") != "error" and t.get("error") is None) / len(turns)
+
+
+def thread_turn_consistency(turns):
+    outputs = [_words(t.get("output")) for t in turns if t.get("output") is not None]
+    if len(outputs) < 2:
+        return 1.0
+    vals = [_jaccard(outputs[i - 1], outputs[i]) for i in range(1, len(outputs))]
+    return sum(vals) / len(vals)
+
+
+def thread_context_retention(turns):
+    """Heuristic fallback: later answers should share vocabulary with earlier
+    user turns. It is deliberately labelled heuristic, not an LLM judgement."""
+    if len(turns) < 2:
+        return 1.0
+    earlier = set()
+    vals = []
+    for i, turn in enumerate(turns):
+        if i > 0:
+            vals.append(_jaccard(_words(turn.get("output")), earlier))
+        earlier |= _words(turn.get("input"))
+    return sum(vals) / len(vals) if vals else 1.0
+
+
+def _transcript(turns, limit=8000):
+    lines = []
+    for i, turn in enumerate(turns):
+        lines.append(f"Turn {i + 1} user: {_text(turn.get('input'))[:1200]}")
+        lines.append(f"Turn {i + 1} assistant: {_text(turn.get('output'))[:1200]}")
+    return "\n".join(lines)[:limit]
+
+
+THREAD_JUDGE_PROMPTS = {
+    "thread_coherence_judge": (
+        "You are grading a multi-turn conversation. Does the assistant stay coherent and "
+        "consistent across turns, without contradicting itself or losing the thread of the "
+        "conversation?\n\n{transcript}\n\n"
+        'Reply ONLY with JSON: {{"score": 0.0-1.0, "rationale": "..."}}'
+    ),
+    "thread_context_retention_judge": (
+        "You are grading whether a multi-turn assistant retains context from earlier turns "
+        "(names, constraints, decisions, and the user's goal).\n\n{transcript}\n\n"
+        'Reply ONLY with JSON: {{"score": 0.0-1.0, "rationale": "..."}}'
+    ),
+}
+
+
+def _parse_judge(content):
+    parsed = {}
+    m = re.search(r"\{.*\}", str(content), re.S)
+    if m:
+        try:
+            parsed = json.loads(m.group(0))
+        except Exception:
+            parsed = {}
+    score = None
+    if isinstance(parsed, dict) and parsed.get("score") is not None:
+        try:
+            score = float(parsed["score"])
+        except (TypeError, ValueError):
+            score = None
+    if score is None:
+        mm = re.search(r"[\"']?score[\"']?\s*[:=]\s*([0-9]*\.?[0-9]+)", str(content), re.I)
+        if mm:
+            try:
+                score = float(mm.group(1))
+            except ValueError:
+                score = None
+    return score, (parsed.get("rationale", "") if isinstance(parsed, dict) else "")
+
+
+def run_thread_judge(name, turns):
+    fallback_reason = "heuristic_fallback: no provider key"
+    if provider_available():
+        prompt = THREAD_JUDGE_PROMPTS[name].format(transcript=_transcript(turns))
+        resp = call_llm([{"role": "user", "content": prompt}])
+        content = (resp or {}).get("content")
+        if content:
+            score, rationale = _parse_judge(content)
+            if score is None:
+                return None, f"judge unparseable: {str(content)[:200]}", "unparseable"
+            return score, rationale or str(content)[:200], "llm"
+        # A configured-but-broken provider (bad key, quota, outage) should not
+        # leave the conversation unscored; deterministic heuristics still give
+        # an actionable signal, clearly labelled as a fallback.
+        fallback_reason = f"heuristic_fallback: provider error ({(resp or {}).get('error')})"
+    if name == "thread_context_retention_judge":
+        s = thread_context_retention(turns)
+    else:
+        s = 0.5 * thread_completion(turns) + 0.5 * thread_turn_consistency(turns)
+    return s, fallback_reason, "heuristic_fallback"
+
+
+def run_thread_scorer(name, turns):
+    if name == "thread_completion":
+        s, r, mode = thread_completion(turns), "fraction of turns with an answer", "deterministic"
+    elif name == "thread_error_free":
+        s, r, mode = thread_error_free(turns), "fraction of turns without an error", "deterministic"
+    elif name == "thread_turn_consistency":
+        s, r, mode = thread_turn_consistency(turns), "lexical consistency between consecutive answers", "deterministic"
+    elif name in THREAD_JUDGE_PROMPTS:
+        s, r, mode = run_thread_judge(name, turns)
+    else:
+        return None
+    return {"name": name, "score": None if s is None else round(float(s), 4),
+            "rationale": r, "judge_mode": mode, "source": "worker"}
+
+
+def run_thread_eval(args):
+    try:
+        detail = _get(f"/projects/{args.project_id}/threads/{args.thread_id}")
+        turns = detail.get("turns") or []
+        names = [s.strip() for s in (args.scorers or "").split(",") if s.strip()] or THREAD_SCORERS
+        log(f"start thread={args.thread_id} turns={len(turns)} scorers={names}")
+        scores = [sc for sc in (run_thread_scorer(n, turns) for n in names) if sc]
+        acc = [s["score"] for s in scores if s.get("score") is not None]
+        summary = {
+            "turns": len(turns),
+            "scores": {s["name"]: s["score"] for s in scores},
+            "mean": round(sum(acc) / len(acc), 4) if acc else None,
+        }
+        if args.job_id:
+            _post(f"/worker_callback/thread/{args.job_id}",
+                  {"scores": scores, "summary": summary, "status": "completed"})
+        log(f"done thread={args.thread_id} scores={len(scores)}")
+    except Exception as e:
+        import traceback
+        log(f"failed thread={args.thread_id}: {e}")
+        if args.job_id:
+            try:
+                _post(f"/worker_callback/thread/{args.job_id}",
+                      {"scores": [], "summary": {"error": str(e),
+                       "trace": traceback.format_exc()[-800:]}, "status": "failed", "error": str(e)})
+            except Exception as post_err:
+                log(f"thread callback failed: {post_err}")
+        raise
+
+
 # ---------------- task output ----------------
 
 def render_prompt(template, record_input):
@@ -311,15 +489,23 @@ def generate_task(record_input, task_mode, salt, prompt_template=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--experiment-id", required=True)
+    ap.add_argument("--experiment-id", default="")
     ap.add_argument("--project-id", required=True)
-    ap.add_argument("--dataset-id", required=True)
+    ap.add_argument("--dataset-id", default="")
     ap.add_argument("--dataset-version-id", default="")
     ap.add_argument("--prompt-version-id", default="")
     ap.add_argument("--experiment-name")
     ap.add_argument("--baseline-id", default="")
-    ap.add_argument("--scorers", default="exact_match,factuality_judge")
+    ap.add_argument("--thread-id", default="")
+    ap.add_argument("--job-id", default="")
+    ap.add_argument("--scorers", default="")
     args = ap.parse_args()
+
+    if args.thread_id:
+        run_thread_eval(args)
+        return
+    if not args.experiment_id or not args.dataset_id:
+        ap.error("--experiment-id and --dataset-id are required for dataset evaluations")
 
     try:
         # An experiment pins an immutable snapshot, so a concurrent dataset edit
@@ -331,6 +517,8 @@ def main():
             ds = _get(f"/datasets/{args.dataset_id}")
         records = ds["records"]
         scorer_names = [s.strip() for s in args.scorers.split(",") if s.strip()]
+        if not scorer_names:
+            scorer_names = ["exact_match", "factuality_judge"]
         builtin = {b["name"]: b["kind"] for b in _get("/scorers")}
 
         prompt_template = None

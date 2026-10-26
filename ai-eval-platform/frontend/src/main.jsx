@@ -6,6 +6,8 @@ import Projects from "./pages/Projects.jsx";
 import Dashboard from "./pages/Dashboard.jsx";
 import Traces from "./pages/Traces.jsx";
 import TraceDetail from "./pages/TraceDetail.jsx";
+import Conversations from "./pages/Conversations.jsx";
+import ThreadDetail from "./pages/ThreadDetail.jsx";
 import Datasets from "./pages/Datasets.jsx";
 import DatasetDetail from "./pages/DatasetDetail.jsx";
 import Experiments from "./pages/Experiments.jsx";
@@ -33,6 +35,8 @@ const router = createBrowserRouter([
       { path: "projects/:pid", element: <Dashboard /> },
       { path: "projects/:pid/traces", element: <Traces /> },
       { path: "projects/:pid/traces/:tid", element: <TraceDetail /> },
+      { path: "projects/:pid/conversations", element: <Conversations /> },
+      { path: "projects/:pid/conversations/:thid", element: <ThreadDetail /> },
       { path: "projects/:pid/datasets", element: <Datasets /> },
       { path: "projects/:pid/datasets/:dsid", element: <DatasetDetail /> },
       { path: "projects/:pid/experiments", element: <Experiments /> },

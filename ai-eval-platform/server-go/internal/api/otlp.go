@@ -33,11 +33,11 @@ import (
 // insertSpanTx writes one span inside the caller's transaction. Callers own
 // locking/serialisation so this function never opens its own connection.
 func insertSpanTx(tx *sql.Tx, projectID string, row model.SpanRow, now string) error {
-	_, err := tx.Exec(`INSERT OR REPLACE INTO spans(id, trace_id, parent_id, name, type, model,
+	_, err := tx.Exec(`INSERT OR REPLACE INTO spans(id, trace_id, thread_id, parent_id, name, type, model,
 		input, output, error, metadata, start_ms, end_ms, latency_ms,
 		prompt_tokens, completion_tokens, cost_usd, status, project_id, created_at, token_source)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		row.ID, row.TraceID, nilIfEmpty(row.ParentID), row.Name, row.Type, nilIfEmpty(row.Model),
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		row.ID, row.TraceID, nilIfEmpty(row.ThreadID), nilIfEmpty(row.ParentID), row.Name, row.Type, nilIfEmpty(row.Model),
 		jsonOrNull(row.Input), jsonOrNull(row.Output), jsonOrNull(row.Error), jsonOrNull(row.Metadata),
 		row.StartMS, row.EndMS, row.LatencyMS, row.PromptTokens, row.CompletionTokens, row.CostUSD,
 		row.Status, projectID, now, row.TokenSource)
@@ -231,6 +231,12 @@ func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) 
 	}
 
 	typ := otelType(kind, modelName != "", isRoot)
+	threadID := firstString(attrs, "thread.id", "thread_id", "gen_ai.conversation.id",
+		"conversation.id", "session.id", "session_id", "trace.thread_id")
+	if threadID == "" {
+		threadID = firstString(resource, "thread.id", "thread_id", "gen_ai.conversation.id",
+			"conversation.id", "session.id", "session_id")
+	}
 	pt := firstInt(attrs, "gen_ai.usage.input_tokens", "gen_ai.usage.prompt_tokens",
 		"llm.token_count.prompt", "prompt_tokens", "input_tokens")
 	ct := firstInt(attrs, "gen_ai.usage.output_tokens", "gen_ai.usage.completion_tokens",
@@ -281,6 +287,7 @@ func otelToRow(sp *tracepb.Span, resource map[string]interface{}, scope string) 
 	return model.SpanRow{
 		ID:       hex.EncodeToString(sp.GetSpanId()),
 		TraceID:  hex.EncodeToString(sp.GetTraceId()),
+		ThreadID: threadID,
 		ParentID: parent, Name: sp.GetName(), Type: typ, Model: modelName,
 		Input: input, Output: output, Error: errVal, Metadata: metaVal,
 		StartMS: start, EndMS: end, LatencyMS: latency,
@@ -350,15 +357,15 @@ func (s *Server) handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathPr
 	}
 
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	s.dbMu.Lock()
-	tx, err := s.DB.Begin()
+	s.telemetryMu.Lock()
+	tx, err := s.Telemetry.Begin()
 	if err != nil {
-		s.dbMu.Unlock()
+		s.telemetryMu.Unlock()
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 	defer tx.Rollback()
-	inserted := 0
+	rows := []model.SpanRow{}
 	for _, rs := range req.GetResourceSpans() {
 		resource := attrsOf(rs.GetResource().GetAttributes())
 		for _, ss := range rs.GetScopeSpans() {
@@ -371,24 +378,67 @@ func (s *Server) handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathPr
 				if row.TraceID == "" {
 					row.TraceID = row.ID
 				}
-				if err := insertSpanTx(tx, projectID, row, now); err != nil {
-					s.dbMu.Unlock()
-					errJSON(w, http.StatusInternalServerError, "span insert: "+err.Error())
-					return
-				}
-				inserted++
+				rows = append(rows, row)
 			}
 		}
 	}
+	// A trace is one turn, so an explicit thread id on any span wins for the
+	// whole trace; otherwise reuse the trace's existing thread or start a
+	// one-turn conversation keyed by the trace id.
+	explicit := map[string]string{}
+	for _, row := range rows {
+		if row.ThreadID != "" && explicit[row.TraceID] == "" {
+			explicit[row.TraceID] = row.ThreadID
+		}
+	}
+	threads := map[string]bool{}
+	for i := range rows {
+		row := &rows[i]
+		if th := explicit[row.TraceID]; th != "" {
+			row.ThreadID = th
+		} else if row.ThreadID == "" {
+			if th := existingThreadTx(tx, projectID, row.TraceID); th != "" {
+				row.ThreadID = th
+			} else {
+				row.ThreadID = row.TraceID
+			}
+		}
+		if err := insertSpanTx(tx, projectID, *row, now); err != nil {
+			s.telemetryMu.Unlock()
+			errJSON(w, http.StatusInternalServerError, "span insert: "+err.Error())
+			return
+		}
+		threads[row.ThreadID] = true
+	}
+	for traceID, threadID := range explicit {
+		if err := assignTraceThreadTx(r.Context(), tx, projectID, traceID, threadID); err != nil {
+			s.telemetryMu.Unlock()
+			errJSON(w, http.StatusInternalServerError, "thread assign: "+err.Error())
+			return
+		}
+		threads[threadID] = true
+	}
+	for threadID := range threads {
+		if err := syncThreadTx(r.Context(), tx, projectID, threadID, now); err != nil {
+			s.telemetryMu.Unlock()
+			errJSON(w, http.StatusInternalServerError, "thread upsert: "+err.Error())
+			return
+		}
+	}
+	if err := pruneThreadsTx(r.Context(), tx, projectID); err != nil {
+		s.telemetryMu.Unlock()
+		errJSON(w, http.StatusInternalServerError, "thread prune: "+err.Error())
+		return
+	}
 	rollupTraceTx(tx)
 	if err := tx.Commit(); err != nil {
-		s.dbMu.Unlock()
+		s.telemetryMu.Unlock()
 		errJSON(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	s.dbMu.Unlock()
+	s.telemetryMu.Unlock()
 
-	s.logf("otlp ingest", "project_id", projectID, "spans", inserted)
+	s.logf("otlp ingest", "project_id", projectID, "spans", len(rows))
 	writeOTLPResponse(w, ct)
 }
 

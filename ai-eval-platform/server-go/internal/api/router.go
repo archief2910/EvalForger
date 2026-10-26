@@ -75,6 +75,16 @@ func (s *Server) Router() http.Handler {
 			s.handleFeedback(w, r, projectID, rest[1])
 		case len(rest) == 1 && rest[0] == "dashboard":
 			s.handleDashboard(w, r, projectID)
+		case len(rest) == 1 && rest[0] == "threads":
+			s.handleThreads(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "threads":
+			s.handleThreadDetail(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "threads" && (rest[2] == "close" || rest[2] == "open"):
+			s.handleThreadStatus(w, r, projectID, rest[1], rest[2])
+		case len(rest) == 3 && rest[0] == "threads" && rest[2] == "scores":
+			s.handleThreadScores(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "threads" && rest[2] == "evaluate":
+			s.handleThreadEvaluate(w, r, projectID, rest[1])
 		case len(rest) == 1 && rest[0] == "datasets":
 			s.handleDatasets(w, r, projectID)
 		case len(rest) == 1 && rest[0] == "prompts":
@@ -158,6 +168,15 @@ func (s *Server) Router() http.Handler {
 		default:
 			errJSON(w, 404, "route not found")
 		}
+	})
+
+	mux.HandleFunc("/api/v1/worker_callback/thread/", func(w http.ResponseWriter, r *http.Request) {
+		jobID := strings.TrimPrefix(r.URL.Path, "/api/v1/worker_callback/thread/")
+		if jobID == "" || strings.Contains(jobID, "/") {
+			errJSON(w, 404, "bad path")
+			return
+		}
+		s.handleThreadCallback(w, r, jobID)
 	})
 
 	mux.HandleFunc("/api/v1/worker_callback/", func(w http.ResponseWriter, r *http.Request) {

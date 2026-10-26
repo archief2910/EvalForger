@@ -24,7 +24,7 @@ If baseline verification is failing, repair that first before adding new scope.
 | Frontend        | `frontend/`               | React 19 + Vite, hand-written CSS   |
 | SDK sample      | `sdk/sample_client.py`    | Proves the ingestion surface        |
 | Tests           | `scripts/`                | smoke, auth, fault, load, MCP       |
-| Database        | `data/ai_eval.db`         | SQLite WAL, embedded migrations     |
+| Database        | `data/control.db` + `data/telemetry.db` | two SQLite WAL files, embedded migrations per plane |
 
 ## Working Rules
 
@@ -50,7 +50,7 @@ A feature is done only when ALL of the following are true:
 
 - [ ] Target behavior is implemented
 - [ ] Go tests pass: `cd server-go && go test ./...`
-- [ ] Smoke tests pass: `python scripts/smoke_api.py` (31 checks)
+- [ ] Smoke tests pass: `python scripts/smoke_api.py` (41 checks)
 - [ ] Auth tests pass: `python scripts/auth_test.py` (44 checks)
 - [ ] MCP tests pass: `python scripts/mcp_test.py` (23 checks)
 - [ ] Evidence recorded in `feature_list.json` or `progress.md`

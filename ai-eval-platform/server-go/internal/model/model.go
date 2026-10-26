@@ -4,6 +4,8 @@ package model
 
 import (
 	"encoding/json"
+	"strconv"
+	"sync/atomic"
 	"time"
 )
 
@@ -11,6 +13,7 @@ import (
 type SpanEvent struct {
 	ID               string      `json:"id,omitempty"`
 	TraceID          string      `json:"trace_id,omitempty"`
+	ThreadID         string      `json:"thread_id,omitempty"`
 	ParentID         string      `json:"parent_id,omitempty"`
 	Name             string      `json:"name"`
 	Type             string      `json:"type"`
@@ -26,22 +29,31 @@ type SpanEvent struct {
 	TokenSource      string      `json:"token_source,omitempty"`
 }
 
-// IngestInput is the body of POST /projects/{id}/spans:ingest.
+// IngestInput is the body of POST /projects/{id}/spans:ingest. ThreadID is an
+// optional conversation id applied to every event in the batch; a per-event
+// thread_id wins, and a trace with no thread id becomes a one-turn thread.
 type IngestInput struct {
-	Events []SpanEvent `json:"events"`
+	ThreadID string      `json:"thread_id,omitempty"`
+	Events   []SpanEvent `json:"events"`
 }
 
 // SpanRow is the storage-shaped span shared by both ingest paths.
 type SpanRow struct {
-	ID, TraceID, ParentID, Name, Type, Model string
-	Input, Output, Error, Metadata           interface{}
-	StartMS, EndMS, LatencyMS                int64
-	PromptTokens, CompletionTokens           int
-	CostUSD                                  float64
-	Status                                   string
+	ID, TraceID, ThreadID, ParentID, Name, Type, Model string
+	Input, Output, Error, Metadata                     interface{}
+	StartMS, EndMS, LatencyMS                          int64
+	PromptTokens, CompletionTokens                     int
+	CostUSD                                            float64
+	Status                                             string
 	// TokenSource is "provider" when the caller reported usage, "estimated"
 	// when this server estimated it, and "" when the span has no LLM usage.
 	TokenSource string
+}
+
+// ThreadEvalInput is persisted in a thread_eval job payload.
+type ThreadEvalInput struct {
+	ThreadID    string   `json:"thread_id"`
+	ScorerNames []string `json:"scorer_names"`
 }
 
 // EvalInput is persisted in jobs.payload and accepted by the evaluations API.
@@ -126,6 +138,15 @@ func EstimateTokens(v interface{}) int {
 
 // NowUTC is the canonical timestamp format used across the database.
 func NowUTC() string { return time.Now().UTC().Format(time.RFC3339Nano) }
+
+// idSeq makes generated ids unique even when the wall clock has coarse
+// granularity (Windows time.Now() resolution is ~15ms).
+var idSeq atomic.Uint64
+
+// NewID returns a sortable, collision-resistant identifier.
+func NewID() string {
+	return time.Now().UTC().Format("20060102150405.000000000") + "-" + strconv.FormatUint(idSeq.Add(1), 10)
+}
 
 // MarshalJSONValue renders a JSON column, falling back to an empty array.
 func MarshalJSONValue(v interface{}) string {

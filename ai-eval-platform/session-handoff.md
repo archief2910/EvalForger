@@ -2,10 +2,10 @@
 
 ## Current Objective
 
-- Goal: finish the EvalForge restructure into idiomatic Go and close the highest-value product
-  gaps (dataset snapshots, prompt pinning, token provenance) without regressing the platform.
-- Current status: restructure and the product gaps are implemented and verified. feat-002,
-  feat-005, feat-008 and the full feat-009 coverage target remain.
+- Goal: add first-class conversations (threads) with thread-level scoring and split storage into
+  control/data planes without regressing the platform.
+- Current status: conversations, dual-plane storage and the legacy upgrade path are implemented
+  and verified. feat-002, feat-005, feat-008 and the full feat-009 coverage target remain.
 - Branch / commit: parent repo `system_crafter`, commit to be created for `ai-eval-platform/`
   only. Do **not** stage the unrelated `horizontal-scaling-with-read-replicas/` deletions.
 
@@ -22,6 +22,12 @@
 - [x] Project-scoped credentials enforced on by-id routes (404 cross-project).
 - [x] UI: snapshot hash, prompt selector, pinned version display, rerun pinned.
 - [x] `--create-key` keeps stdout clean; docs/harness updated for `go build ./cmd/server`.
+- [x] Split storage into `control.db` (metadata) and `telemetry.db` (spans/feedback/eval_runs/
+      threads/scores), with one-time legacy adoption and Go-side cross-plane merges.
+- [x] Conversations: `thread_id` on ingest/OTLP, trace-id fallback, open/closed idle lifecycle,
+      thread scores, five thread evaluators, durable thread-eval jobs and idempotent callbacks.
+- [x] UI: Conversations list/detail, dashboard conversation metrics, trace list filter/column,
+      trace detail conversation bar; seed creates 8 multi-turn demo conversations.
 
 ## Verification Evidence
 
@@ -30,21 +36,24 @@
 | Build | `cd server-go && go build -o evalforge.exe ./cmd/server` | pass | |
 | Vet | `cd server-go && go vet ./...` | pass | |
 | Go tests | `cd server-go && go test ./... -count=1` | pass | 3 consecutive runs |
-| Smoke | `python scripts/smoke_api.py` | 31/31 | |
+| Smoke | `python scripts/smoke_api.py` | 41/41 | |
 | Auth | `python scripts/auth_test.py` | 44/44 | |
 | MCP | `python scripts/mcp_test.py` | 23/23 | |
 | Fault | `python scripts/fault_test.py` | 16/16 | crash/restart, timeout, retry |
-| Load | `python scripts/load_test.py` | pass | 360 traces, 0 errors, ~1,000 spans/s |
+| Load | `python scripts/load_test.py` | pass | 360/360 traces, 0 errors, 1080 spans |
 | Frontend | `cd frontend && npm run build` | pass | |
 | Auth-required eval | manual run | pass | completed, 2 runs, snapshot pinned |
 
 ## Files Changed
 
-- New: `server-go/cmd/`, `server-go/internal/`, `internal/database/migrations/`
-- Modified: `worker-py/worker.py`, three frontend pages, five Python test scripts,
-  `README.md`, `docs/ARCHITECTURE.md`, `AGENTS.md`, `init.sh`,
-  `feature_list.json`, `progress.md`
-- Deleted: the old root `server-go/*.go` files (copied to `%TEMP%\evalforge-old\`)
+- New: `server-go/internal/api/{threads.go,threads_test.go}`,
+  `server-go/internal/database/{migrate.go,legacy.go}`,
+  `server-go/internal/database/migrations/{control,telemetry}/`,
+  `frontend/src/pages/{Conversations,ThreadDetail}.jsx`
+- Modified: `server-go/cmd/server/main.go`, `internal/{config,api,queue,worker}`,
+  `worker-py/{worker.py,seed.py}`, frontend routes/sidebar/dashboard/traces,
+  `scripts/{smoke_api,fault_test}.py`, `README.md`, `docs/ARCHITECTURE.md`, `AGENTS.md`,
+  `init.sh`, `feature_list.json`, `progress.md`
 
 ## Decisions Made
 
@@ -54,6 +63,9 @@
 - Zero usage on an LLM span means "not reported" → estimate and label `estimated`.
 - Internal worker token is boot-scoped and only passed through the child environment.
 - Cross-project by-id access returns 404, never 403.
+- Control and telemetry are separate SQLite files; handlers merge in Go rather than joining files.
+- A trace is one turn; explicit `thread_id` groups turns, and the trace id is the one-turn fallback.
+- Thread evaluations use the durable queue (`kind='thread_eval'`) and idempotent worker callbacks.
 
 ## Blockers / Risks
 
@@ -61,7 +73,7 @@
   working tree. Do not commit them; restore from git only with user confirmation.
 - feat-002 (typed errors), feat-005 (repository interfaces), feat-008 (DB-backed scorer
   definitions) are real architectural gaps, not cosmetic.
-- SQLite remains a single-writer deployment assumption.
+- Each SQLite file remains a single-writer deployment assumption.
 - feat-009 route coverage has not been measured against the 80% target.
 
 ## Next Session Startup

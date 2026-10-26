@@ -173,19 +173,19 @@ func TestTokenSourceIsExplicit(t *testing.T) {
 	}
 
 	var source string
-	if err := e.s.DB.QueryRow(`SELECT token_source FROM spans WHERE id='reported'`).Scan(&source); err != nil {
+	if err := e.s.Telemetry.QueryRow(`SELECT token_source FROM spans WHERE id='reported'`).Scan(&source); err != nil {
 		t.Fatal(err)
 	}
 	if source != "provider" {
 		t.Errorf("reported token_source = %q, want provider", source)
 	}
-	if err := e.s.DB.QueryRow(`SELECT token_source FROM spans WHERE id='estimated'`).Scan(&source); err != nil {
+	if err := e.s.Telemetry.QueryRow(`SELECT token_source FROM spans WHERE id='estimated'`).Scan(&source); err != nil {
 		t.Fatal(err)
 	}
 	if source != "estimated" {
 		t.Errorf("estimated token_source = %q, want estimated", source)
 	}
-	if err := e.s.DB.QueryRow(`SELECT COALESCE(token_source,'') FROM spans WHERE id='plain'`).Scan(&source); err != nil {
+	if err := e.s.Telemetry.QueryRow(`SELECT COALESCE(token_source,'') FROM spans WHERE id='plain'`).Scan(&source); err != nil {
 		t.Fatal(err)
 	}
 	if source != "" {

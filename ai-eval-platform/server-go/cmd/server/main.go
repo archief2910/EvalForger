@@ -52,26 +52,19 @@ func run(args []string) error {
 		return nil
 	}
 
-	db, err := database.Open(cfg)
-	if err != nil {
-		return err
-	}
-	defer db.Close()
-
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	if err := database.Migrate(ctx, db, log); err != nil {
+	// Two independent SQLite files. OpenStores migrates both, adopts the old
+	// single-file layout on first boot and backfills conversation threads.
+	stores, err := database.OpenStores(ctx, cfg, log)
+	if err != nil {
 		return err
 	}
-	if err := database.SeedPrices(ctx, db); err != nil {
-		return fmt.Errorf("seed model prices: %w", err)
-	}
-	if err := database.MigrateLegacy(ctx, db, cfg.LegacyDB, log); err != nil {
-		return fmt.Errorf("migrate legacy database: %w", err)
-	}
+	defer stores.Control.Close()
+	defer stores.Telemetry.Close()
 
-	server := api.New(db, cfg, log)
+	server := api.New(stores.Control, stores.Telemetry, cfg, log)
 
 	// --create-key bootstraps the first credential of an auth-required
 	// deployment without opening an HTTP port. The key goes to stdout so it can
@@ -80,7 +73,7 @@ func run(args []string) error {
 		return createKey(server, args)
 	}
 
-	q := queue.New(db, server.WriteMutex(), log, cfg.JobLease, server.RunJob, server.RetireExperiment)
+	q := queue.New(stores.Control, server.WriteMutex(), log, cfg.JobLease, server.RunJob, server.RetireExperiment)
 	server.AttachQueue(q)
 
 	sigCh := make(chan os.Signal, 1)
@@ -100,7 +93,8 @@ func run(args []string) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("server listening", "addr", cfg.Addr, "db", cfg.DBPath, "auth", cfg.AuthMode)
+		log.Info("server listening", "addr", cfg.Addr,
+			"control_db", cfg.ControlDBPath, "telemetry_db", cfg.TelemetryDBPath, "auth", cfg.AuthMode)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}

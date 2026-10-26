@@ -67,6 +67,16 @@ export default function TraceDetail() {
     <div>
       <div className="row"><Link to={`/projects/${pid}/traces`} style={{ color: "var(--muted)" }}>← Logs</Link></div>
       <h1>Trace <span className="mono" style={{ fontSize: 13 }}>{tid.slice(0, 8)}</span></h1>
+      <div className="row" style={{ margin: "6px 0 4px", color: "var(--muted)", fontSize: 12, flexWrap: "wrap" }}>
+        <span>Conversation</span>
+        <Link className="mono" style={{ fontSize: 11.5 }}
+          to={`/projects/${pid}/conversations/${encodeURIComponent(d.thread_id || tid)}`}>
+          {(d.thread_id || tid).length > 32 ? (d.thread_id || tid).slice(0, 32) + "…" : (d.thread_id || tid)}
+        </Link>
+        <span className={"pill " + (d.thread?.status === "open" ? "ok" : "")}>{d.thread?.status || "unknown"}</span>
+        <span>{fmt.num(d.thread?.turn_count)} turn{d.thread?.turn_count === 1 ? "" : "s"}</span>
+        <Link to={`/projects/${pid}/traces?thread_id=${encodeURIComponent(d.thread_id || tid)}`}>all turns →</Link>
+      </div>
       <p className="sub">Nested spans with duration, tokens and cost. Review the trace and promote useful cases into a dataset.</p>
       <div className="grid cols2" style={{ alignItems: "start", gridTemplateColumns: "1.1fr 1fr" }}>
         <div className="panel tree">

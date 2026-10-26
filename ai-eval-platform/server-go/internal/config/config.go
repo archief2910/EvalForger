@@ -19,19 +19,22 @@ import (
 // Config is the immutable runtime configuration. Load() is the only
 // constructor; callers should pass it by value.
 type Config struct {
-	Addr          string
-	DataDir       string
-	DBPath        string
-	LogLevel      slog.Level
-	AuthMode      string
-	PublicBaseURL string
-	WorkerPath    string
-	WorkerTimeout time.Duration
-	JobLease      time.Duration
-	PythonBin     string
-	LegacyDB      string
-	MCPAPIBase    string
-	MCPAPIKey     string
+	Addr            string
+	DataDir         string
+	DBPath          string // compatibility alias for the control-plane path
+	ControlDBPath   string
+	TelemetryDBPath string
+	LogLevel        slog.Level
+	AuthMode        string
+	PublicBaseURL   string
+	WorkerPath      string
+	WorkerTimeout   time.Duration
+	JobLease        time.Duration
+	ThreadIdle      time.Duration
+	PythonBin       string
+	LegacyDB        string
+	MCPAPIBase      string
+	MCPAPIKey       string
 
 	// ServerBaseURL is the origin this process is reachable at, derived from
 	// Addr unless overridden. The worker and MCP client use it to call back.
@@ -51,12 +54,24 @@ func Load() (Config, error) {
 		WorkerPath:    env("WORKER_PATH", filepath.Join("..", "worker-py", "worker.py")),
 		WorkerTimeout: 12 * time.Minute,
 		JobLease:      45 * time.Second,
+		ThreadIdle:    30 * time.Minute,
 		PythonBin:     env("PYTHON_BIN", "python"),
 		LegacyDB:      os.Getenv("LEGACY_DB"),
 		MCPAPIKey:     os.Getenv("MCP_API_KEY"),
 	}
 
-	c.DBPath = filepath.Join(c.DataDir, "ai_eval.db")
+	// Two independent SQLite files. DBPath is retained as the control-plane
+	// alias so older callers and logs keep working.
+	c.ControlDBPath = filepath.Join(c.DataDir, "control.db")
+	c.TelemetryDBPath = filepath.Join(c.DataDir, "telemetry.db")
+	c.DBPath = c.ControlDBPath
+	if v := os.Getenv("CONTROL_DB_PATH"); v != "" {
+		c.ControlDBPath = v
+		c.DBPath = v
+	}
+	if v := os.Getenv("TELEMETRY_DB_PATH"); v != "" {
+		c.TelemetryDBPath = v
+	}
 
 	if v := os.Getenv("WORKER_TIMEOUT_SECONDS"); v != "" {
 		n, err := strconv.Atoi(v)
@@ -71,6 +86,13 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("JOB_LEASE_SECONDS must be a positive integer, got %q", v)
 		}
 		c.JobLease = time.Duration(n) * time.Second
+	}
+	if v := os.Getenv("THREAD_IDLE_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("THREAD_IDLE_SECONDS must be a positive integer, got %q", v)
+		}
+		c.ThreadIdle = time.Duration(n) * time.Second
 	}
 
 	level := env("LOG_LEVEL", "info")
@@ -111,8 +133,15 @@ func (c Config) Validate() error {
 	if c.JobLease < time.Second {
 		return fmt.Errorf("job lease must be at least 1s")
 	}
+	if c.ThreadIdle < time.Second {
+		return fmt.Errorf("thread idle timeout must be at least 1s")
+	}
 	if c.WorkerPath == "" {
 		return fmt.Errorf("WORKER_PATH must not be empty")
+	}
+	if c.ControlDBPath != "" && c.TelemetryDBPath != "" &&
+		filepath.Clean(c.ControlDBPath) == filepath.Clean(c.TelemetryDBPath) {
+		return fmt.Errorf("CONTROL_DB_PATH and TELEMETRY_DB_PATH must be different files")
 	}
 	return nil
 }

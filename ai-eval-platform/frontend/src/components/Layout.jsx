@@ -30,6 +30,7 @@ export function Sidebar() {
           <div className="nav-group">Observe</div>
           <NavLink className="nav-item" to={`/projects/${pid}`} end={loc.pathname === `/projects/${pid}`}>Dashboard</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/traces`}>Logs &amp; Traces</NavLink>
+          <NavLink className="nav-item" to={`/projects/${pid}/conversations`}>Conversations</NavLink>
           <div className="nav-group">Evaluate</div>
           <NavLink className="nav-item" to={`/projects/${pid}/datasets`}>Datasets</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/experiments`}>Experiments</NavLink>

@@ -144,7 +144,7 @@ def wait_for(fn, timeout, interval=0.4):
 
 
 def db_conn(data_dir):
-    return sqlite3.connect(os.path.join(data_dir, "ai_eval.db"), timeout=10)
+    return sqlite3.connect(os.path.join(data_dir, "control.db"), timeout=10)
 
 
 def make_project_and_dataset(base, records=3):

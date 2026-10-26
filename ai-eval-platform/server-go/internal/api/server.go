@@ -22,10 +22,16 @@ import (
 )
 
 // Server is the application object. Wiring lives in cmd/server; this type owns
-// the database handle, the durable queue and the process-boundary clients.
+// the two database handles, the durable queue and the process-boundary clients.
+//
+// DB is the control plane (metadata, jobs, credentials). Telemetry is the
+// append-heavy plane (spans, feedback, eval runs, conversations). Each plane
+// has its own write mutex so a slow telemetry write never blocks metadata.
 type Server struct {
-	DB   *sql.DB
-	dbMu sync.Mutex // serialises SQLite write transactions
+	DB          *sql.DB
+	Telemetry   *sql.DB
+	dbMu        sync.Mutex // serialises control-plane write transactions
+	telemetryMu sync.Mutex // serialises telemetry-plane write transactions
 
 	cfg config.Config
 	log *slog.Logger
@@ -50,9 +56,10 @@ type Server struct {
 
 // New constructs the API surface. Start() is called separately so tests can
 // exercise handlers without launching the dispatcher or scrubber.
-func New(db *sql.DB, cfg config.Config, log *slog.Logger) *Server {
+func New(control, telemetry *sql.DB, cfg config.Config, log *slog.Logger) *Server {
 	s := &Server{
-		DB:            db,
+		DB:            control,
+		Telemetry:     telemetry,
 		cfg:           cfg,
 		log:           log,
 		baseURL:       cfg.Issuer(),
@@ -89,8 +96,11 @@ func (s *Server) AttachQueue(q *queue.Queue) { s.queue = q }
 // Queue returns the attached queue (tests use it for health assertions).
 func (s *Server) Queue() *queue.Queue { return s.queue }
 
-// WriteMutex exposes the SQLite writer lock to the queue.
+// WriteMutex exposes the control-plane SQLite writer lock to the queue.
 func (s *Server) WriteMutex() *sync.Mutex { return &s.dbMu }
+
+// TelemetryMutex exposes the telemetry-plane writer lock to background work.
+func (s *Server) TelemetryMutex() *sync.Mutex { return &s.telemetryMu }
 
 // SetBaseURL is used by tests that start an httptest server on a random port.
 // Production wiring gets the same value from config.
@@ -144,11 +154,23 @@ func (s *Server) startBackground(ctx context.Context) *sync.WaitGroup {
 			}
 		}
 	}()
+	// Conversation lifecycle: close threads that have been idle longer than
+	// THREAD_IDLE_SECONDS. New activity reopens them automatically.
+	if s.Telemetry != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.sweepThreads(ctx)
+		}()
+	}
 	return &wg
 }
 
 // RunJob is the queue handler: decode the job payload and run one worker.
 func (s *Server) RunJob(ctx context.Context, j queue.Job) queue.Outcome {
+	if j.Kind == queue.KindThreadEval {
+		return s.runThreadJob(ctx, j)
+	}
 	var in model.EvalInput
 	if err := json.Unmarshal([]byte(j.Payload), &in); err != nil {
 		return queue.Outcome{Diagnostic: "bad job payload: " + err.Error()}
@@ -162,6 +184,32 @@ func (s *Server) RunJob(ctx context.Context, j queue.Job) queue.Outcome {
 		_ = s.DB.QueryRow(`SELECT status FROM experiments WHERE id=?`, j.ExperimentID).Scan(&status)
 		if status == "running" {
 			s.retireExperiment(j.ExperimentID, "worker exited without reporting results")
+		}
+	}
+	return queue.Outcome(out)
+}
+
+// runThreadJob executes one thread evaluation. The worker reads the
+// conversation over HTTP, computes thread scorers and POSTs them back to the
+// thread callback. A clean exit without any score is a failed attempt, so the
+// queue can retry instead of silently doing nothing.
+func (s *Server) runThreadJob(ctx context.Context, j queue.Job) queue.Outcome {
+	var in model.ThreadEvalInput
+	if err := json.Unmarshal([]byte(j.Payload), &in); err != nil {
+		return queue.Outcome{Diagnostic: "bad thread job payload: " + err.Error()}
+	}
+	threadID := in.ThreadID
+	if threadID == "" {
+		threadID = j.ThreadID
+	}
+	out := s.worker.RunThread(ctx, worker.ThreadRequest{
+		JobID: j.ID, ProjectID: j.ProjectID, ThreadID: threadID, ScorerNames: in.ScorerNames,
+	})
+	if out.Diagnostic == "" && !out.TimedOut && s.Telemetry != nil {
+		var n int
+		_ = s.Telemetry.QueryRow(`SELECT COUNT(*) FROM thread_scores WHERE job_id=?`, j.ID).Scan(&n)
+		if n == 0 {
+			return queue.Outcome{Diagnostic: "worker exited without reporting thread scores"}
 		}
 	}
 	return queue.Outcome(out)

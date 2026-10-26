@@ -85,6 +85,7 @@ implementation path, not code.
 | Load benchmark with integrity assertions | `python scripts/load_test.py` → 1,080 spans in 1.4–2.8 s (390–770 spans/s), read p95 ~33 ms, 0 errors, 0 duplicates |
 | UI end-to-end (feedback → promote → eval → compare) | driven in a browser; dataset v3→v4, experiment completed with 7 runs, job `done attempts=1` |
 | MCP server (`--mcp`): 11 tools over stdio JSON-RPC, API-client design | `server-go/mcp.go`; `scripts/mcp_test.py` **23/23**; also driven by the official `mcp` Python SDK |
+| Control/data plane split (`control.db` + `telemetry.db`) and first-class conversations with thread-level scoring | `internal/database/{db,legacy,migrate}.go`, `internal/api/threads.go`, `threads_test.go`; smoke **41/41**, fault **16/16** |
 | Documented corrections and roadmap | this file |
 
 ---

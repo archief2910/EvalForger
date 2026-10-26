@@ -99,20 +99,70 @@ export default function Dashboard() {
             <div className="panel"><h2 style={{ marginTop: 0 }}>Requests per bucket</h2><BarChart series={d.timeseries || []} metric="requests" /></div>
             <div className="panel"><h2 style={{ marginTop: 0 }}>Latency p95</h2><LineChart series={d.timeseries || []} metric="latency_p95" /></div>
           </div>
-          <div className="panel" style={{ marginTop: 14 }}>
-            <h2 style={{ marginTop: 0 }}>Model breakdown</h2>
-            <table>
-              <thead><tr><th>Model</th><th>LLM calls</th><th /></tr></thead>
-              <tbody>
-                {(d.model_breakdown || []).map((m) => (
-                  <tr key={m.model}>
-                    <td className="mono">{m.model}</td><td>{fmt.num(m.count)}</td>
-                    <td><div className="bar" style={{ width: Math.max(2, (m.count / Math.max(1, d.requests)) * 100) + "%" }} /></td>
-                  </tr>
-                ))}
-                {!(d.model_breakdown || []).length && <tr><td colSpan={3} className="empty">No LLM calls in range</td></tr>}
-              </tbody>
-            </table>
+
+          <div className="row" style={{ marginTop: 24, justifyContent: "space-between" }}>
+            <h2 style={{ margin: 0 }}>Conversations</h2>
+            <Link className="btn ghost" to={`/projects/${pid}/conversations`}>Open conversations →</Link>
+          </div>
+          <p className="sub" style={{ marginTop: 4 }}>Multi-turn threads, their activity, and conversation-level scores.</p>
+          <div className="grid cols4">
+            <div className="panel stat">
+              <div className="label">Conversations</div>
+              <div className="value">{fmt.num(d.threads?.total)}</div>
+              <div className="hint">{fmt.num(d.threads?.open)} open · {fmt.num(d.threads?.closed)} closed</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Avg turns</div>
+              <div className="value">{d.threads?.avg_turns == null ? "–" : Number(d.threads.avg_turns).toFixed(1)}</div>
+              <div className="hint">traces per conversation</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Avg duration</div>
+              <div className="value">{fmt.ms(d.threads?.avg_duration_ms)}</div>
+              <div className="hint">first turn → last activity</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Score samples</div>
+              <div className="value">{fmt.num((d.thread_scores || []).reduce((a, s) => a + (s.count || 0), 0))}</div>
+              <div className="hint">conversation-level scores recorded</div>
+            </div>
+          </div>
+
+          <div className="grid cols2" style={{ marginTop: 14 }}>
+            <div className="panel">
+              <h2 style={{ marginTop: 0 }}>Model breakdown</h2>
+              <table>
+                <thead><tr><th>Model</th><th>LLM calls</th><th /></tr></thead>
+                <tbody>
+                  {(d.model_breakdown || []).map((m) => (
+                    <tr key={m.model}>
+                      <td className="mono">{m.model}</td><td>{fmt.num(m.count)}</td>
+                      <td><div className="bar" style={{ width: Math.max(2, (m.count / Math.max(1, d.requests)) * 100) + "%" }} /></td>
+                    </tr>
+                  ))}
+                  {!(d.model_breakdown || []).length && <tr><td colSpan={3} className="empty">No LLM calls in range</td></tr>}
+                </tbody>
+              </table>
+            </div>
+            <div className="panel">
+              <h2 style={{ marginTop: 0 }}>Conversation scores</h2>
+              <table>
+                <thead><tr><th>Scorer</th><th>Average</th><th>Samples</th><th /></tr></thead>
+                <tbody>
+                  {(d.thread_scores || []).map((s) => (
+                    <tr key={s.name}>
+                      <td className="mono">{s.name}</td>
+                      <td className={s.avg >= 0.8 ? "pos" : s.avg < 0.5 ? "neg" : ""}>{Number(s.avg).toFixed(2)}</td>
+                      <td style={{ color: "var(--muted)" }}>{fmt.num(s.count)}</td>
+                      <td><div className="bar" style={{ width: Math.max(2, s.avg * 100) + "%" }} /></td>
+                    </tr>
+                  ))}
+                  {!(d.thread_scores || []).length && (
+                    <tr><td colSpan={4} className="empty">No conversation scores yet. Open a conversation and evaluate it.</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
           </div>
         </>
       )}

@@ -123,21 +123,21 @@
   <text class="t body" x="380" y="420">worker callback</text>
   <text class="m lbl" x="380" y="435">delete + insert runs in a tx (idempotent)</text>
 
-  <text class="m body" x="368" y="478">SQLite WAL · 8-conn pool · dbMu serialises writes</text>
+  <text class="m body" x="368" y="478">two SQLite WAL files · 8-conn pools · write mutexes</text>
   <text class="m body" x="368" y="498">.env loaded at boot · key never logged</text>
   <text class="m body" x="368" y="518">GO_SERVER handed to the worker (non-default port safe)</text>
   <text class="m body" x="368" y="546" style="fill:#8b93a7">AUTH_MODE=required: API keys + OAuth PKCE · project-scoped keys</text>
 
   <!-- ── sqlite ── -->
   <rect class="boxdb" x="760" y="80" width="230" height="212" rx="10"/>
-  <text class="t title" x="776" y="106">SQLite</text>
-  <text class="m body" x="776" y="123">data/ai_eval.db</text>
-  <text class="m lbl" x="776" y="147">projects      feedback</text>
-  <text class="m lbl" x="776" y="163">spans         datasets</text>
-  <text class="m lbl" x="776" y="179">dataset_records</text>
-  <text class="m lbl" x="776" y="195">experiments   eval_runs</text>
-  <text class="m lbl" x="776" y="211">prompts       model_prices</text>
-  <text class="m lbl" x="776" y="227">scorers  (unused)   jobs (durable)</text>
+  <text class="t title" x="776" y="106">SQLite · two planes</text>
+  <text class="m body" x="776" y="123">control.db · telemetry.db</text>
+  <text class="m lbl" x="776" y="147">control: projects datasets prompts</text>
+  <text class="m lbl" x="776" y="163">experiments jobs scorers keys</text>
+  <text class="m lbl" x="776" y="179">telemetry: spans feedback eval_runs</text>
+  <text class="m lbl" x="776" y="195">threads thread_scores</text>
+  <text class="m lbl" x="776" y="211">merged in Go — no cross-file joins</text>
+  <text class="m lbl" x="776" y="227">legacy ai_eval.db adopted once</text>
   <text class="m lbl" x="776" y="252">journal: WAL · busy_timeout 5000</text>
   <text class="m lbl" x="776" y="267">JSON columns for every payload</text>
   <text class="m lbl" x="776" y="282">root span == trace row</text>
@@ -148,8 +148,8 @@
   <text class="m body" x="776" y="373">worker-py/worker.py</text>
   <text class="m lbl" x="776" y="396">one subprocess per experiment</text>
   <text class="m lbl" x="776" y="412">4 records in parallel (thread pool)</text>
-  <text class="m lbl" x="776" y="428">6 deterministic scorers</text>
-  <text class="m lbl" x="776" y="444">2 LLM judges (factuality, helpful)</text>
+  <text class="m lbl" x="776" y="428">deterministic + LLM scorers</text>
+  <text class="m lbl" x="776" y="444">thread + record evaluators</text>
   <text class="m lbl" x="776" y="460">judge_mode on every score</text>
   <text class="m lbl" x="776" y="476">offline simulator if no key</text>
   <text class="m lbl" x="776" y="492">retry + token-budget escalation</text>

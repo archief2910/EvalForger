@@ -1,33 +1,11 @@
--- 0001_init.sql
--- The schema as it existed before migrations were introduced. It is idempotent
--- so it can also bootstrap an existing database on first upgrade.
+-- 0001_init.sql (control plane)
+-- Small, relational, transactional state: projects, datasets, experiments,
+-- prompts and credentials. Telemetry lives in a separate SQLite file.
+-- Idempotent so an existing single-file database can be adopted in place.
 
 CREATE TABLE IF NOT EXISTS projects (
   id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT DEFAULT '',
   created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS spans (
-  id TEXT PRIMARY KEY,
-  trace_id TEXT NOT NULL,
-  parent_id TEXT,
-  name TEXT NOT NULL,
-  type TEXT NOT NULL DEFAULT 'task',
-  model TEXT,
-  input TEXT, output TEXT, error TEXT, metadata TEXT,
-  start_ms INTEGER NOT NULL, end_ms INTEGER NOT NULL, latency_ms INTEGER NOT NULL,
-  prompt_tokens INTEGER DEFAULT 0, completion_tokens INTEGER DEFAULT 0,
-  cost_usd REAL DEFAULT 0,
-  status TEXT NOT NULL DEFAULT 'ok',
-  project_id TEXT NOT NULL,
-  created_at TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_spans_project ON spans(project_id);
-CREATE INDEX IF NOT EXISTS idx_spans_trace ON spans(trace_id);
-
-CREATE TABLE IF NOT EXISTS feedback (
-  id TEXT PRIMARY KEY, trace_id TEXT, span_id TEXT, kind TEXT NOT NULL,
-  value TEXT, comment TEXT, created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS datasets (
@@ -51,12 +29,6 @@ CREATE TABLE IF NOT EXISTS experiments (
   dataset_id TEXT, baseline_experiment_id TEXT,
   status TEXT NOT NULL DEFAULT 'pending', summary TEXT,
   created_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS eval_runs (
-  id TEXT PRIMARY KEY, experiment_id TEXT NOT NULL, record_id TEXT,
-  input TEXT, expected TEXT, output TEXT, error TEXT,
-  latency_ms INTEGER, scores TEXT, output_mode TEXT DEFAULT '', created_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS prompts (

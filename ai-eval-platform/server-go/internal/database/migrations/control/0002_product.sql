@@ -1,9 +1,6 @@
--- 0002_product.sql
--- Reproducibility and honest cost reporting:
---   * immutable dataset snapshots pinned by experiments
---   * prompt versions pinned by experiments
---   * explicit token provenance (provider-reported vs estimated)
---   * database-backed feedback definitions (scorer registry)
+-- 0002_product.sql (control plane)
+-- Reproducibility: immutable dataset snapshots, pinned prompt versions and a
+-- database-backed feedback definition registry.
 
 CREATE TABLE IF NOT EXISTS dataset_versions (
   id TEXT PRIMARY KEY,
@@ -22,8 +19,6 @@ CREATE INDEX IF NOT EXISTS idx_dataset_versions_dataset ON dataset_versions(data
 
 ALTER TABLE experiments ADD COLUMN dataset_version_id TEXT;
 ALTER TABLE experiments ADD COLUMN prompt_version_id TEXT;
-
-ALTER TABLE spans ADD COLUMN token_source TEXT DEFAULT '';
 
 CREATE TABLE IF NOT EXISTS feedback_definitions (
   id TEXT PRIMARY KEY,

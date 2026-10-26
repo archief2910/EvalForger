@@ -1,12 +1,16 @@
 import { useEffect, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { api, fmt } from "../api.js";
 
 export default function Traces() {
   const { pid } = useParams();
   const nav = useNavigate();
+  const [sp] = useSearchParams();
   const [data, setData] = useState({ traces: [], total: 0 });
-  const [flt, setFlt] = useState({ search: "", status: "", model: "", has_feedback: "", sort_by: "start_ms", sort_dir: "desc" });
+  const [flt, setFlt] = useState({
+    search: "", status: "", model: "", has_feedback: "", thread_id: sp.get("thread_id") || "",
+    sort_by: "start_ms", sort_dir: "desc",
+  });
   const [models, setModels] = useState([]);
 
   const load = (f) => {
@@ -28,6 +32,8 @@ export default function Traces() {
       <div className="toolbar">
         <input placeholder="Search input/output…" style={{ width: 220 }} value={flt.search}
           onChange={(e) => set({ search: e.target.value })} />
+        <input placeholder="Conversation id…" style={{ width: 180 }} value={flt.thread_id}
+          onChange={(e) => set({ thread_id: e.target.value })} />
         <select value={flt.status} onChange={(e) => set({ status: e.target.value })}>
           <option value="">All statuses</option><option value="ok">ok</option><option value="error">error</option>
         </select>
@@ -52,7 +58,7 @@ export default function Traces() {
         <table>
           <thead>
             <tr>
-              <th>Input</th><th>Status</th><th>Latency</th><th>Spans</th><th>Model</th><th>Cost</th><th>Meta</th>
+              <th>Input</th><th>Conversation</th><th>Status</th><th>Latency</th><th>Spans</th><th>Model</th><th>Cost</th><th>Meta</th>
             </tr>
           </thead>
           <tbody>
@@ -63,6 +69,15 @@ export default function Traces() {
                     {typeof t.input === "string" ? t.input : JSON.stringify(t.input)}
                   </div>
                   <div style={{ color: "var(--muted)", fontSize: 11 }}>{t.name} · {new Date(t.start_ms).toLocaleString()}</div>
+                </td>
+                <td onClick={(e) => e.stopPropagation()}>
+                  {t.thread_id ? (
+                    <Link className="mono" style={{ fontSize: 11 }}
+                      title={t.thread_id}
+                      to={`/projects/${pid}/conversations/${encodeURIComponent(t.thread_id)}`}>
+                      {t.thread_id.length > 18 ? t.thread_id.slice(0, 18) + "…" : t.thread_id}
+                    </Link>
+                  ) : <span style={{ color: "var(--muted)" }}>–</span>}
                 </td>
                 <td><span className={"pill " + (t.status === "error" ? "error" : "ok")}>{t.status}</span></td>
                 <td>{fmt.ms(t.latency_ms)}</td>
@@ -76,7 +91,7 @@ export default function Traces() {
                 </td>
               </tr>
             ))}
-            {!data.traces.length && <tr><td colSpan={7} className="empty">No traces match the filters.</td></tr>}
+            {!data.traces.length && <tr><td colSpan={8} className="empty">No traces match the filters.</td></tr>}
           </tbody>
         </table>
       </div>

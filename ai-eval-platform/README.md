@@ -14,8 +14,9 @@ Three docs worth reading first:
 Open [docs/architecture.html](docs/architecture.html) in a browser for the rendered diagram.
 
 ## Stack
-- **API server**: Go (`server-go/`, module `evalforge`) — single static binary, owns the SQLite database and the whole
-  `/api/v1` surface (ingest, traces, dashboard, datasets, prompts, experiments) plus the MCP and OAuth endpoints.
+- **API server**: Go (`server-go/`, module `evalforge`) — single static binary, owns the two SQLite databases and the
+  whole `/api/v1` surface (ingest, traces, conversations, dashboard, datasets, prompts, experiments) plus the MCP and
+  OAuth endpoints.
 - **Eval worker**: Python (`worker-py/worker.py`) — the Go server dispatches an eval job to it; the worker
   generates outputs, applies the scorers, and posts results back over the worker-callback API.
 - **Frontend**: React 19 + Vite, original dark UI (`frontend/`), proxies `/api` → `localhost:8000`.
@@ -26,7 +27,7 @@ Open [docs/architecture.html](docs/architecture.html) in a browser for the rende
 server-go/
   cmd/server/main.go        # flags, config, migrate, serve, graceful shutdown
   internal/config/          # typed env config + validation
-  internal/database/        # SQLite pool, embedded migrations, legacy import
+  internal/database/        # dual SQLite planes, embedded migrations, legacy import
   internal/model/           # domain types, pricing, token estimation
   internal/queue/           # durable claim/lease/heartbeat/retry queue
   internal/worker/          # Python subprocess boundary
@@ -35,13 +36,27 @@ server-go/
 Handlers are methods on `api.Server`; dependencies are constructor-injected. The binary is built with
 `go build ./cmd/server`, not from the repository root.
 
+### Control plane and data plane
+
+Storage is deliberately split into two SQLite files:
+
+| File | Owns | Why |
+|---|---|---|
+| `data/control.db` | projects, datasets, dataset versions/records, prompts, experiments, scorers, model prices, jobs, API keys/OAuth, feedback definitions | small, relational, backed up with configuration |
+| `data/telemetry.db` | spans, feedback, eval runs, conversations (`threads`), conversation scores | append-heavy, retained/vacuumed/scaled independently |
+
+Handlers never join across the files. They query one plane, then merge in Go, so the telemetry file can
+move to cheaper storage or a separate database without rewriting the product surface. An existing
+`data/ai_eval.db` is adopted once: metadata becomes `control.db`, telemetry is imported into
+`telemetry.db`, and every historical trace is backfilled into a one-turn conversation.
+
 ## Run it
 ```bash
 # 1) API server (from ai-eval-platform/server-go)
 cd ai-eval-platform/server-go
 go build -o evalforge.exe ./cmd/server && ./evalforge.exe     # → http://localhost:8000
 
-# 2) demo data (seeds a project with 36 traces, 2 datasets, 2 prompts)
+# 2) demo data (36 traces, including 8 multi-turn conversations, 2 datasets, 2 prompts)
 cd ai-eval-platform && python worker-py/seed.py
 
 # 3) frontend (new terminal)
@@ -65,25 +80,27 @@ answer. The worker handles that by escalating `max_tokens` and retrying, and rec
 `judge_mode: provider_error` (never a fake `0.0`) when no answer arrives.
 
 ## The core workflow (5 minutes)
-1. **Logs & Traces** — filter by status/model/has-feedback, open a trace: nested span tree + timeline, per-span tokens/cost.
-2. **Review** — thumbs + comment on a trace, edit the *expected* answer.
-3. **Add to dataset** — one click promotes the trace (`input` copied, `expected` = your corrected answer, `metadata.origin_trace_id` = reference back to the trace).
-4. **Run evaluation** — pick a dataset, select scorers (deterministic + LLM-as-judge), optionally pin a prompt version, choose a baseline experiment → an immutable experiment is created. The dataset is snapshotted first, so later edits cannot change what the run saw.
-5. **Compare** — per-case deltas by input alignment; improvement/regression badges per scorer. **Rerun pinned** reuses the same dataset snapshot and prompt version.
-6. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown. Token counts reported by the provider are labelled `provider`; estimates are labelled `estimated` in the trace view.
+1. **Logs & Traces** — filter by status/model/has-feedback/conversation, open a trace: nested span tree + timeline, per-span tokens/cost.
+2. **Conversations** — every trace belongs to a conversation (`thread_id`, falling back to the trace id). Open one to see its turns, close/reopen it, add a conversation-level score, or run the thread evaluators (completion, error-free, turn consistency, coherence/context-retention judges). Idle conversations close automatically after `THREAD_IDLE_SECONDS`.
+3. **Review** — thumbs + comment on a trace, edit the *expected* answer.
+4. **Add to dataset** — one click promotes the trace (`input` copied, `expected` = your corrected answer, `metadata.origin_trace_id` = reference back to the trace).
+5. **Run evaluation** — pick a dataset, select scorers (deterministic + LLM-as-judge), optionally pin a prompt version, choose a baseline experiment → an immutable experiment is created. The dataset is snapshotted first, so later edits cannot change what the run saw.
+6. **Compare** — per-case deltas by input alignment; improvement/regression badges per scorer. **Rerun pinned** reuses the same dataset snapshot and prompt version.
+7. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown, conversation counts and conversation-score averages. Token counts reported by the provider are labelled `provider`; estimates are labelled `estimated` in the trace view.
 
 ## API surface (`/api/v1`)
 | Area | Endpoints |
 |---|---|
 | Projects | `GET/POST /projects`, `GET /projects/{id}` |
 | Ingest | `POST /projects/{id}/spans:ingest` (batch of span events), `POST /v1/traces` (OTLP/HTTP, protobuf + JSON) |
-| Observe | `GET /projects/{id}/traces`, `GET /projects/{id}/traces/{trace_id}`, `POST /projects/{id}/traces/{trace_id}/feedback` |
-| Dashboard | `GET /projects/{id}/dashboard` |
+| Observe | `GET /projects/{id}/traces` (incl. `?thread_id=`), `GET /projects/{id}/traces/{trace_id}`, `POST /projects/{id}/traces/{trace_id}/feedback` |
+| Conversations | `GET /projects/{id}/threads`, `GET /projects/{id}/threads/{id}`, `POST …/{id}/close`, `POST …/{id}/open`, `GET/POST …/{id}/scores`, `POST …/{id}/evaluate` |
+| Dashboard | `GET /projects/{id}/dashboard` (traces + conversation metrics and score aggregates) |
 | Datasets | `GET/POST /projects/{id}/datasets`, `GET /datasets/{id}`, `POST /datasets/{id}/records` (single object **or** array), `POST /datasets/{id}/records:from_trace`, `GET /datasets/{id}/versions`, `GET /dataset_versions/{id}` |
 | Evaluate | `GET /scorers`, `POST /projects/{id}/evaluations`, `GET /projects/{id}/experiments`, `GET /experiments/{id}`, `GET /experiments/{id}/compare?baseline_id=` |
 | Prompts | `GET/POST /projects/{id}/prompts`, `GET /prompts/{version_id}` |
 | Credentials | `GET/POST /keys`, `DELETE /keys/{id}`, `GET /whoami` |
-| Worker | `POST /worker_callback/{experiment_id}` (results written by the Python worker) |
+| Worker | `POST /worker_callback/{experiment_id}`, `POST /worker_callback/thread/{job_id}` (results written by the Python worker) |
 
 ## Ingest from your app
 
@@ -204,7 +221,7 @@ Expired codes and tokens are scrubbed hourly.
 
 ## Scripts
 ```bash
-python scripts/smoke_api.py     # 31-check contract run on a private server + temp DB (demo data untouched)
+python scripts/smoke_api.py     # 41-check contract run on a private server + temp DB (demo data untouched)
 python scripts/auth_test.py     # 44 checks: keys, scopes, PKCE flow, refresh rotation, revocation, MCP auth
 python scripts/fault_test.py    # 16 checks: crash mid-eval, hung worker, worker crash + retry
 python scripts/load_test.py     # concurrent ingest/query benchmark with integrity assertions
@@ -230,7 +247,10 @@ Environment knobs for the server/worker split:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `DATA_DIR` | `../data` | SQLite directory |
+| `DATA_DIR` | `../data` | base directory for both SQLite files |
+| `CONTROL_DB_PATH` | `$DATA_DIR/control.db` | control-plane SQLite file (metadata, must differ from telemetry) |
+| `TELEMETRY_DB_PATH` | `$DATA_DIR/telemetry.db` | data-plane SQLite file (traces, conversations, scores) |
+| `THREAD_IDLE_SECONDS` | `1800` | idle conversations close after this many seconds; new activity reopens them |
 | `ADDR` | `:8000` | listen address |
 | `AUTH_MODE` | `off` | `required` enforces API keys / OAuth tokens on every non-public route |
 | `PUBLIC_BASE_URL` | listen address | public origin used in OAuth discovery and token audience (set it behind a proxy) |
@@ -243,5 +263,6 @@ Environment knobs for the server/worker split:
 
 ## Product notes (why this loops)
 - Traces, datasets and experiments share one span-shaped data model, so production failures become regression tests without re-plumbing.
-- Honest scoring: every score carries its `judge_mode` (`llm` vs `heuristic_fallback`) and an unparseable judge answer is recorded as *absent*, never as a silent `0.0`.
+- Conversations are first-class: a trace is one turn, `thread_id` groups turns, and thread-level scores are stored separately from per-trace scores so multi-turn quality is measurable on its own.
+- Honest scoring: every score carries its `judge_mode` (`llm` vs `heuristic_fallback`) and an unparseable judge answer is recorded as *absent*, never as a silent `0.0`. Conversation judges also fall back to deterministic heuristics when the provider is configured but broken.
 - Metering-friendly by design: spans carry byte/estimable payload; every recorded score is attributable (the two metrics Braintrust bills on).

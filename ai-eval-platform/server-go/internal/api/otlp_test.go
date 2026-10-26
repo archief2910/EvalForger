@@ -202,7 +202,7 @@ func TestOTLPJSONIngestAndEmptyBatch(t *testing.T) {
 		t.Fatalf("empty status = %d", rec.Code)
 	}
 	var n int
-	if err := db.QueryRow(`SELECT COUNT(*) FROM projects WHERE name='ghost'`).Scan(&n); err != nil {
+	if err := s.DB.QueryRow(`SELECT COUNT(*) FROM projects WHERE name='ghost'`).Scan(&n); err != nil {
 		t.Fatal(err)
 	}
 	if n != 0 {

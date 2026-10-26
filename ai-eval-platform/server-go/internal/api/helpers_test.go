@@ -41,37 +41,34 @@ func newTestEnvWithAuth(t *testing.T, auth bool) *testEnv {
 	if auth {
 		cfg.AuthMode = "required"
 	}
-	cfg.DBPath = database.Path(cfg.DataDir)
+	cfg.ControlDBPath = database.Path(cfg.DataDir)
+	cfg.TelemetryDBPath = database.TelemetryPath(cfg.DataDir)
 	cfg.ServerBaseURL = "http://127.0.0.1:0"
 	cfg.MCPAPIBase = cfg.ServerBaseURL
 
-	db, err := database.Open(cfg)
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	if err := database.Migrate(ctx, db, log); err != nil {
-		t.Fatalf("migrate: %v", err)
-	}
-	if err := database.SeedPrices(ctx, db); err != nil {
-		t.Fatalf("seed prices: %v", err)
+	stores, err := database.OpenStores(ctx, cfg, log)
+	if err != nil {
+		t.Fatalf("open stores: %v", err)
 	}
 
-	s := New(db, cfg, log)
+	s := New(stores.Control, stores.Telemetry, cfg, log)
 	srv := httptest.NewServer(s.Handler())
 	s.SetBaseURL(srv.URL)
 
 	t.Cleanup(func() {
 		srv.Close()
-		_ = db.Close()
+		_ = stores.Control.Close()
+		_ = stores.Telemetry.Close()
 	})
 	return &testEnv{srv: srv, s: s}
 }
 
-// testServer keeps the OTLP tests terse: they only need the Server and its DB.
+// testServer keeps the OTLP tests terse: they only need the Server and the
+// telemetry DB where spans land.
 func testServer(t *testing.T) (*Server, *sql.DB) {
 	t.Helper()
 	e := newTestEnvWithAuth(t, false)
-	return e.s, e.s.DB
+	return e.s, e.s.Telemetry
 }

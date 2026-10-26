@@ -254,6 +254,74 @@ def run_checks():
           f"requests={dash.get('requests')} p95={dash.get('latency', {}).get('p95')} "
           f"models={len(dash.get('model_breakdown', []))}")
 
+    # ---- conversations (threads): two turns, lifecycle, scores, async eval ----
+    t2 = now + 5000
+    for i, (q, a) in enumerate([
+        ("How do I reset my password?", "Use the account recovery flow."),
+        ("And what if the email never arrives?", "Check spam, then contact support."),
+    ]):
+        tid = f"smoke-turn-{i + 1}"
+        st, _ = call("POST", f"/api/v1/projects/{pid}/spans:ingest", {
+            "thread_id": "smoke-thread",
+            "events": [{
+                "id": tid, "name": "support_agent", "type": "task",
+                "input": q, "output": a, "start_ms": t2 + i * 60_000,
+                "end_ms": t2 + i * 60_000 + 500,
+            }],
+        })
+        check(f"thread turn {i + 1} ingest", st == 200, f"status={st}")
+
+    st, threads = call("GET", f"/api/v1/projects/{pid}/threads")
+    thread_list = threads.get("threads", [])
+    th = next((x for x in thread_list if x.get("id") == "smoke-thread"), None) if isinstance(thread_list, list) else None
+    check("threads list", st == 200 and bool(th) and th.get("turn_count") == 2,
+          f"total={threads.get('total')} turns={th.get('turn_count') if th else None}")
+
+    st, td = call("GET", f"/api/v1/projects/{pid}/threads/smoke-thread")
+    check("thread detail returns turns", st == 200 and len(td.get("turns", [])) == 2,
+          f"status={st} turns={len(td.get('turns', []))}")
+
+    st, sc = call("POST", f"/api/v1/projects/{pid}/threads/smoke-thread/scores",
+                  {"name": "thread_completion", "score": 1.0, "rationale": "smoke manual"})
+    st2, td = call("GET", f"/api/v1/projects/{pid}/threads/smoke-thread")
+    summary = td.get("score_summary", {})
+    check("thread score save + summary", st == 200 and bool(sc.get("id")) and
+          summary.get("thread_completion", {}).get("avg") == 1.0,
+          f"status={st} summary={summary}")
+
+    st, _ = call("POST", f"/api/v1/projects/{pid}/threads/smoke-thread/close")
+    st2, td = call("GET", f"/api/v1/projects/{pid}/threads/smoke-thread")
+    check("thread manual close", st == 200 and td.get("thread", {}).get("status") == "closed",
+          f"status={st} thread={td.get('thread', {}).get('status')}")
+    st, _ = call("POST", f"/api/v1/projects/{pid}/threads/smoke-thread/open")
+    st2, td = call("GET", f"/api/v1/projects/{pid}/threads/smoke-thread")
+    check("thread manual reopen", st == 200 and td.get("thread", {}).get("status") == "open",
+          f"status={st} thread={td.get('thread', {}).get('status')}")
+
+    st, job = call("POST", f"/api/v1/projects/{pid}/threads/smoke-thread/evaluate",
+                   {"scorers": ["thread_completion", "thread_error_free", "thread_turn_consistency"]})
+    job_id = job.get("job_id")
+    check("thread evaluation enqueued", st == 200 and bool(job_id), f"status={st} job={job_id}")
+    scored = None
+    deadline = time.time() + 90
+    while time.time() < deadline and job_id:
+        st, td = call("GET", f"/api/v1/projects/{pid}/threads/smoke-thread")
+        evals = [e for e in td.get("evaluations", []) if e.get("job_id") == job_id]
+        worker_scores = [x for x in td.get("scores", []) if x.get("job_id") == job_id]
+        if evals and evals[0].get("status") == "done" and len(worker_scores) == 3:
+            scored = worker_scores
+            break
+        time.sleep(0.5)
+    check("thread evaluation scores conversation", bool(scored),
+          f"scores={len(scored or [])}")
+
+    st, dash2 = call("GET", f"/api/v1/projects/{pid}/dashboard")
+    thread_metrics = dash2.get("threads", {})
+    score_names = {x.get("name") for x in dash2.get("thread_scores", [])}
+    check("dashboard includes conversation metrics",
+          st == 200 and thread_metrics.get("total", 0) >= 1 and "thread_completion" in score_names,
+          f"threads={thread_metrics} scores={sorted(score_names)}")
+
     st, scorers = call("GET", "/api/v1/scorers")
     names = {s["name"] for s in scorers} if isinstance(scorers, list) else set()
     check("scorer registry", st == 200 and {"exact_match", "factuality_judge"} <= names, f"n={len(names)}")

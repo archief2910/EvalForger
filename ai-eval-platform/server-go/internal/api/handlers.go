@@ -37,9 +37,9 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 		return
 	}
 	inserted, tracesCreated := 0, 0
-	s.dbMu.Lock()
-	defer s.dbMu.Unlock()
-	tx, err := s.DB.Begin()
+	s.telemetryMu.Lock()
+	defer s.telemetryMu.Unlock()
+	tx, err := s.Telemetry.Begin()
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
@@ -51,8 +51,8 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 	// spans and flushes on span end, so a child can precede its root), so the
 	// trace id is resolved in a second pass instead of a single parent lookup.
 	type prep struct {
-		id, parent, trace string
-		ev                model.SpanEvent
+		id, parent, trace, thread string
+		ev                        model.SpanEvent
 	}
 	preps := make([]prep, 0, len(in.Events))
 	index := map[string]int{}
@@ -95,8 +95,33 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 		}
 	}
 
+	// Resolve the conversation for every trace in the batch. An explicit
+	// thread_id (per event or batch-wide) wins; a trace that already has a
+	// thread keeps it; otherwise the trace id becomes a one-turn thread so
+	// every trace is addressable as a conversation.
+	explicitThread := map[string]string{}
+	for _, pr := range preps {
+		th := pr.ev.ThreadID
+		if th == "" {
+			th = in.ThreadID
+		}
+		if th != "" && explicitThread[pr.trace] == "" {
+			explicitThread[pr.trace] = th
+		}
+	}
+	for pi := range preps {
+		if th := explicitThread[preps[pi].trace]; th != "" {
+			preps[pi].thread = th
+		} else if th := existingThreadTx(tx, projectID, preps[pi].trace); th != "" {
+			preps[pi].thread = th
+		} else {
+			preps[pi].thread = preps[pi].trace
+		}
+	}
+
 	// --- pass 2: insert ---
 	now := time.Now().UTC().Format(time.RFC3339Nano)
+	threads := map[string]bool{}
 	for _, pr := range preps {
 		ev := pr.ev
 		id := pr.id
@@ -149,7 +174,7 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 		}
 		cost := float64(pt)/1000*ip + float64(ct)/1000*op
 		if err := insertSpanTx(tx, projectID, model.SpanRow{
-			ID: id, TraceID: traceID, ParentID: ev.ParentID, Name: ev.Name, Type: ev.Type,
+			ID: id, TraceID: traceID, ThreadID: pr.thread, ParentID: ev.ParentID, Name: ev.Name, Type: ev.Type,
 			Model: modelName, Input: ev.Input, Output: ev.Output, Error: ev.Error, Metadata: ev.Metadata,
 			StartMS: start, EndMS: end, LatencyMS: latency,
 			PromptTokens: pt, CompletionTokens: ct, CostUSD: cost, Status: status,
@@ -158,7 +183,25 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 			errJSON(w, 500, "span insert: "+err.Error())
 			return
 		}
+		threads[pr.thread] = true
 		inserted++
+	}
+	for traceID, threadID := range explicitThread {
+		if err := assignTraceThreadTx(r.Context(), tx, projectID, traceID, threadID); err != nil {
+			errJSON(w, 500, "thread assign: "+err.Error())
+			return
+		}
+		threads[threadID] = true
+	}
+	for threadID := range threads {
+		if err := syncThreadTx(r.Context(), tx, projectID, threadID, now); err != nil {
+			errJSON(w, 500, "thread upsert: "+err.Error())
+			return
+		}
+	}
+	if err := pruneThreadsTx(r.Context(), tx, projectID); err != nil {
+		errJSON(w, 500, "thread prune: "+err.Error())
+		return
 	}
 	// roll up root latency from children + propagate child errors
 	rollupTraceTx(tx)
@@ -214,6 +257,10 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request, projectID 
 	if q.Get("has_feedback") == "true" {
 		where = append(where, "EXISTS (SELECT 1 FROM feedback f WHERE f.trace_id=s.trace_id)")
 	}
+	if v := q.Get("thread_id"); v != "" {
+		where = append(where, "s.thread_id=?")
+		args = append(args, v)
+	}
 	orderBy := "s.start_ms DESC"
 	sortBy := q.Get("sort_by")
 	if sortBy == "latency_ms" || sortBy == "cost_usd" || sortBy == "start_ms" {
@@ -232,7 +279,7 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request, projectID 
 	fmt.Sscanf(q.Get("offset"), "%d", &offset)
 
 	whereSQL := strings.Join(where, " AND ")
-	rows, err := s.DB.Query(`SELECT s.trace_id, s.name, s.input, s.output, s.error, s.metadata,
+	rows, err := s.Telemetry.Query(`SELECT s.trace_id, COALESCE(s.thread_id,''), s.name, s.input, s.output, s.error, s.metadata,
 		`+traceModelsExpr+` AS models, s.status, s.latency_ms,
 		`+traceCostExpr+` AS trace_cost, s.start_ms,
 		(SELECT COUNT(*) FROM spans c WHERE c.trace_id=s.trace_id) AS span_count
@@ -246,15 +293,16 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request, projectID 
 	var out []map[string]interface{}
 	for rows.Next() {
 		m := map[string]interface{}{}
-		var traceID, name, status string
+		var traceID, threadID, name, status string
 		var input, output, errStr, metadata, models sql.NullString
 		var latency, startMS int64
 		var cost float64
 		var spanCount int
-		if err := rows.Scan(&traceID, &name, &input, &output, &errStr, &metadata, &models, &status, &latency, &cost, &startMS, &spanCount); err != nil {
+		if err := rows.Scan(&traceID, &threadID, &name, &input, &output, &errStr, &metadata, &models, &status, &latency, &cost, &startMS, &spanCount); err != nil {
 			continue
 		}
 		m["trace_id"] = traceID
+		m["thread_id"] = threadID
 		m["name"] = name
 		m["input"] = parseJSONPtr(input.String)
 		m["output"] = parseJSONPtr(output.String)
@@ -272,7 +320,7 @@ func (s *Server) handleTraces(w http.ResponseWriter, r *http.Request, projectID 
 		out = []map[string]interface{}{}
 	}
 	total := 0
-	s.DB.QueryRow(`SELECT COUNT(*) FROM spans s WHERE `+whereSQL, args...).Scan(&total)
+	s.Telemetry.QueryRow(`SELECT COUNT(*) FROM spans s WHERE `+whereSQL, args...).Scan(&total)
 	writeJSON(w, 200, map[string]interface{}{"traces": out, "total": total})
 }
 
@@ -299,7 +347,7 @@ func spanTree(root map[string]interface{}, all map[string]map[string]interface{}
 }
 
 func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request, projectID, traceID string) {
-	rows, err := s.DB.Query(`SELECT id, trace_id, parent_id, name, type, model, input, output, error,
+	rows, err := s.Telemetry.Query(`SELECT id, trace_id, COALESCE(thread_id,''), parent_id, name, type, model, input, output, error,
 		metadata, start_ms, end_ms, latency_ms, prompt_tokens, completion_tokens, cost_usd, status,
 		COALESCE(token_source,'')
 		FROM spans WHERE trace_id=? AND project_id=? ORDER BY start_ms`, traceID, projectID)
@@ -310,19 +358,23 @@ func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request, proje
 	defer rows.Close()
 	all := map[string]map[string]interface{}{}
 	order := []string{}
+	threadID := ""
 	for rows.Next() {
-		var id, tid, name, typ, status string
+		var id, tid, thid, name, typ, status string
 		var parentID, model sql.NullString
 		var input, output, errStr, metadata sql.NullString
 		var start, end, latency int64
 		var pt, ct int
 		var cost float64
 		var tokenSource string
-		if err := rows.Scan(&id, &tid, &parentID, &name, &typ, &model, &input, &output, &errStr, &metadata, &start, &end, &latency, &pt, &ct, &cost, &status, &tokenSource); err != nil {
+		if err := rows.Scan(&id, &tid, &thid, &parentID, &name, &typ, &model, &input, &output, &errStr, &metadata, &start, &end, &latency, &pt, &ct, &cost, &status, &tokenSource); err != nil {
 			continue
 		}
+		if threadID == "" {
+			threadID = thid
+		}
 		m := map[string]interface{}{
-			"id": id, "trace_id": tid, "name": name, "type": typ, "model": model.String,
+			"id": id, "trace_id": tid, "thread_id": thid, "name": name, "type": typ, "model": model.String,
 			"input": parseJSONPtr(input.String), "output": parseJSONPtr(output.String),
 			"error": parseJSONPtr(errStr.String), "metadata": parseJSONPtr(metadata.String),
 			"start_ms": start, "end_ms": end, "latency_ms": latency,
@@ -347,8 +399,28 @@ func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request, proje
 			roots = append(roots, m)
 		}
 	}
+	if threadID == "" {
+		threadID = traceID
+	}
+	thread := map[string]interface{}{"id": threadID, "status": "unknown"}
+	var thStatus string
+	var started, last int64
+	var ended sql.NullInt64
+	var threadTurns int
+	if err := s.Telemetry.QueryRow(`SELECT status, started_at_ms, last_activity_ms, ended_at_ms, trace_count
+		FROM threads WHERE project_id=? AND id=?`, projectID, threadID).
+		Scan(&thStatus, &started, &last, &ended, &threadTurns); err == nil {
+		thread = map[string]interface{}{
+			"id": threadID, "status": thStatus, "started_at_ms": started,
+			"last_activity_ms": last, "trace_count": threadTurns, "turn_count": threadTurns,
+			"duration_ms": last - started,
+		}
+		if ended.Valid {
+			thread["ended_at_ms"] = ended.Int64
+		}
+	}
 	fb := []map[string]interface{}{}
-	frows, err := s.DB.Query(`SELECT id, trace_id, span_id, kind, value, comment, created_at FROM feedback WHERE trace_id=? ORDER BY created_at DESC`, traceID)
+	frows, err := s.Telemetry.Query(`SELECT id, trace_id, span_id, kind, value, comment, created_at FROM feedback WHERE trace_id=? ORDER BY created_at DESC`, traceID)
 	if err == nil {
 		defer frows.Close()
 		for frows.Next() {
@@ -364,7 +436,10 @@ func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request, proje
 	if fb == nil {
 		fb = []map[string]interface{}{}
 	}
-	writeJSON(w, 200, map[string]interface{}{"trace_id": traceID, "span_tree": roots, "feedback": fb})
+	writeJSON(w, 200, map[string]interface{}{
+		"trace_id": traceID, "thread_id": threadID, "thread": thread,
+		"span_tree": roots, "feedback": fb,
+	})
 }
 
 type feedbackIn struct {
@@ -387,10 +462,10 @@ func (s *Server) handleFeedback(w http.ResponseWriter, r *http.Request, projectI
 	} else if in.Value != nil {
 		val = j(in.Value)
 	}
-	s.dbMu.Lock()
-	_, err := s.DB.Exec(`INSERT INTO feedback(id, trace_id, span_id, kind, value, comment, created_at) VALUES (?,?,?,?,?,?,?)`,
+	s.telemetryMu.Lock()
+	_, err := s.Telemetry.Exec(`INSERT INTO feedback(id, trace_id, span_id, kind, value, comment, created_at) VALUES (?,?,?,?,?,?,?)`,
 		id, traceID, nilIfEmpty(in.SpanID), in.Kind, val, in.Comment, time.Now().UTC().Format(time.RFC3339Nano))
-	s.dbMu.Unlock()
+	s.telemetryMu.Unlock()
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
@@ -418,7 +493,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 	fmt.Sscanf(r.URL.Query().Get("hours"), "%d", &hours)
 	since := time.Now().UnixMilli() - int64(hours)*3600*1000
 
-	rootRows, err := s.DB.Query(`SELECT latency_ms, status, name, start_ms FROM spans
+	rootRows, err := s.Telemetry.Query(`SELECT latency_ms, status, name, start_ms FROM spans
 		WHERE project_id=? AND parent_id IS NULL AND start_ms>=?`, projectID, since)
 	if err != nil {
 		errJSON(w, 500, err.Error())
@@ -437,7 +512,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 	}
 	rootRows.Close()
 
-	allRows, err := s.DB.Query(`SELECT model, prompt_tokens, completion_tokens, cost_usd, start_ms FROM spans
+	allRows, err := s.Telemetry.Query(`SELECT model, prompt_tokens, completion_tokens, cost_usd, start_ms FROM spans
 		WHERE project_id=? AND start_ms>=?`, projectID, since)
 	if err != nil {
 		errJSON(w, 500, err.Error())
@@ -536,6 +611,51 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 	if mb == nil {
 		mb = []map[string]interface{}{}
 	}
+
+	// Conversation-level monitoring: how many threads are active, how long they
+	// last, and the average of each thread scorer. These are the numbers that
+	// single-trace dashboards cannot show.
+	threadStats := map[string]interface{}{
+		"total": 0, "open": 0, "closed": 0, "avg_turns": 0.0, "avg_duration_ms": 0.0,
+	}
+	var thTotal, thOpen, thClosed int
+	var thAvgTurns, thAvgDuration sql.NullFloat64
+	if err := s.Telemetry.QueryRow(`SELECT COUNT(*),
+			COALESCE(SUM(CASE WHEN status='open' THEN 1 ELSE 0 END),0),
+			COALESCE(SUM(CASE WHEN status='closed' THEN 1 ELSE 0 END),0),
+			AVG(trace_count), AVG(last_activity_ms-started_at_ms)
+		FROM threads WHERE project_id=? AND last_activity_ms>=?`, projectID, since).
+		Scan(&thTotal, &thOpen, &thClosed, &thAvgTurns, &thAvgDuration); err == nil {
+		threadStats["total"] = thTotal
+		threadStats["open"] = thOpen
+		threadStats["closed"] = thClosed
+		if thAvgTurns.Valid {
+			threadStats["avg_turns"] = round4(thAvgTurns.Float64)
+		}
+		if thAvgDuration.Valid {
+			threadStats["avg_duration_ms"] = thAvgDuration.Float64
+		}
+	}
+	threadScores := []map[string]interface{}{}
+	tsRows, err := s.Telemetry.Query(`SELECT ts.name, AVG(ts.score), COUNT(ts.score), MAX(ts.created_at)
+		FROM thread_scores ts
+		JOIN threads t ON t.project_id=ts.project_id AND t.id=ts.thread_id
+		WHERE ts.project_id=? AND ts.score IS NOT NULL AND t.last_activity_ms>=?
+		GROUP BY ts.name ORDER BY ts.name`, projectID, since)
+	if err == nil {
+		defer tsRows.Close()
+		for tsRows.Next() {
+			var name, last string
+			var avg float64
+			var count int
+			if tsRows.Scan(&name, &avg, &count, &last) == nil {
+				threadScores = append(threadScores, map[string]interface{}{
+					"name": name, "avg": round4(avg), "count": count, "last": last,
+				})
+			}
+		}
+	}
+
 	writeJSON(w, 200, map[string]interface{}{
 		"requests": n,
 		"errors":   errors,
@@ -563,6 +683,8 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 		"span_count":      len(all),
 		"model_breakdown": mb,
 		"timeseries":      ts,
+		"threads":         threadStats,
+		"thread_scores":   threadScores,
 	})
 }
 
@@ -828,13 +950,18 @@ func (s *Server) handleRecordFromTrace(w http.ResponseWriter, r *http.Request, _
 		Tags     []string    `json:"tags"`
 	}
 	json.NewDecoder(r.Body).Decode(&in)
-	// find project + root input from trace
+	// find project + root input from the telemetry plane, then verify the
+	// dataset lives in the same project in the control plane.
 	var projectID, rootInput string
-	err := s.DB.QueryRow(`SELECT s.project_id, s.input FROM spans s
-		JOIN datasets d ON d.project_id = s.project_id
-		WHERE s.trace_id=? AND s.parent_id IS NULL LIMIT 1`, in.TraceID).Scan(&projectID, &rootInput)
+	err := s.Telemetry.QueryRow(`SELECT project_id, input FROM spans
+		WHERE trace_id=? AND parent_id IS NULL LIMIT 1`, in.TraceID).Scan(&projectID, &rootInput)
 	if err != nil || !allowProject(r, projectID) {
 		errJSON(w, 404, "trace not found")
+		return
+	}
+	var datasetProject string
+	if err := s.DB.QueryRow(`SELECT project_id FROM datasets WHERE id=?`, dsID).Scan(&datasetProject); err != nil || datasetProject != projectID {
+		errJSON(w, 404, "dataset not found in this project")
 		return
 	}
 	id := newID()
@@ -914,18 +1041,30 @@ func (s *Server) handlePrompts(w http.ResponseWriter, r *http.Request, projectID
 // ---------- scorers (registry served by Go; execution in worker) ----------
 
 var builtinScorers = []map[string]interface{}{
-	{"name": "exact_match", "kind": "deterministic", "description": "Case-insensitive exact match against expected"},
-	{"name": "contains", "kind": "deterministic", "description": "Expected substring present in output"},
-	{"name": "levenshtein_similarity", "kind": "deterministic", "description": "1 - edit distance / max length"},
-	{"name": "json_valid", "kind": "deterministic", "description": "Output parses as valid JSON"},
-	{"name": "numeric_diff", "kind": "deterministic", "description": "Numeric closeness of first number in output vs expected"},
-	{"name": "regex_guard", "kind": "deterministic", "description": "Pattern guard (must_match / must_not_match), e.g. no PII"},
-	{"name": "factuality_judge", "kind": "llm_judge", "description": "LLM-as-judge: factual correctness vs expected"},
-	{"name": "helpfulness_judge", "kind": "llm_judge", "description": "LLM-as-judge: helpfulness of the response"},
+	{"name": "exact_match", "kind": "deterministic", "scope": "record", "description": "Case-insensitive exact match against expected"},
+	{"name": "contains", "kind": "deterministic", "scope": "record", "description": "Expected substring present in output"},
+	{"name": "levenshtein_similarity", "kind": "deterministic", "scope": "record", "description": "1 - edit distance / max length"},
+	{"name": "json_valid", "kind": "deterministic", "scope": "record", "description": "Output parses as valid JSON"},
+	{"name": "numeric_diff", "kind": "deterministic", "scope": "record", "description": "Numeric closeness of first number in output vs expected"},
+	{"name": "regex_guard", "kind": "deterministic", "scope": "record", "description": "Pattern guard (must_match / must_not_match), e.g. no PII"},
+	{"name": "factuality_judge", "kind": "llm_judge", "scope": "record", "description": "LLM-as-judge: factual correctness vs expected"},
+	{"name": "helpfulness_judge", "kind": "llm_judge", "scope": "record", "description": "LLM-as-judge: helpfulness of the response"},
+	{"name": "thread_completion", "kind": "deterministic", "scope": "thread", "description": "Fraction of conversation turns that produced an answer"},
+	{"name": "thread_error_free", "kind": "deterministic", "scope": "thread", "description": "Fraction of conversation turns without an error"},
+	{"name": "thread_turn_consistency", "kind": "deterministic", "scope": "thread", "description": "Lexical consistency between consecutive answers"},
+	{"name": "thread_coherence_judge", "kind": "llm_judge", "scope": "thread", "description": "LLM-as-judge: does the conversation stay coherent across turns?"},
+	{"name": "thread_context_retention_judge", "kind": "llm_judge", "scope": "thread", "description": "LLM-as-judge: does the assistant retain context from earlier turns?"},
 }
 
 func (s *Server) handleScorers(w http.ResponseWriter, r *http.Request, _ ...string) {
-	writeJSON(w, 200, builtinScorers)
+	scope := r.URL.Query().Get("scope")
+	out := make([]map[string]interface{}, 0, len(builtinScorers))
+	for _, sc := range builtinScorers {
+		if scope == "" || sc["scope"] == scope {
+			out = append(out, sc)
+		}
+	}
+	writeJSON(w, 200, out)
 }
 
 // ---------- evaluations (Go dispatches, Python worker runs) ----------
@@ -1038,7 +1177,7 @@ func (s *Server) handleExperimentDetail(w http.ResponseWriter, r *http.Request, 
 	var datasetName string
 	s.DB.QueryRow(`SELECT name FROM datasets WHERE id=?`, datasetID).Scan(&datasetName)
 	runs := []map[string]interface{}{}
-	rows, err := s.DB.Query(`SELECT id, record_id, input, expected, output, error, latency_ms, scores, output_mode, created_at
+	rows, err := s.Telemetry.Query(`SELECT id, record_id, input, expected, output, error, latency_ms, scores, output_mode, created_at
 		FROM eval_runs WHERE experiment_id=? ORDER BY created_at`, expID)
 	if err == nil {
 		defer rows.Close()
@@ -1072,8 +1211,7 @@ func (s *Server) handleExperimentDetail(w http.ResponseWriter, r *http.Request, 
 func (s *Server) handleExperimentsList(w http.ResponseWriter, r *http.Request, projectID string) {
 	rows, err := s.DB.Query(`SELECT e.id, e.name, e.dataset_id, e.baseline_experiment_id, e.status, e.summary, e.created_at,
 		COALESCE(e.dataset_version_id,''), COALESCE(e.prompt_version_id,''),
-		d.name AS dataset_name,
-		(SELECT COUNT(*) FROM eval_runs r WHERE r.experiment_id=e.id) AS run_count
+		d.name AS dataset_name
 		FROM experiments e LEFT JOIN datasets d ON d.id=e.dataset_id
 		WHERE e.project_id=? ORDER BY e.created_at DESC`, projectID)
 	if err != nil {
@@ -1081,19 +1219,48 @@ func (s *Server) handleExperimentsList(w http.ResponseWriter, r *http.Request, p
 		return
 	}
 	defer rows.Close()
-	out := []map[string]interface{}{}
+	type expRow struct {
+		id, name, datasetID, status, created, datasetName string
+		datasetVersionID, promptVersionID                 string
+		baseline, summary                                 sql.NullString
+	}
+	var expRows []expRow
+	ids := []string{}
 	for rows.Next() {
-		var id, name, datasetID, status, created, datasetName string
-		var datasetVersionID, promptVersionID string
-		var baseline, summary sql.NullString
-		var runCount int
-		rows.Scan(&id, &name, &datasetID, &baseline, &status, &summary, &created,
-			&datasetVersionID, &promptVersionID, &datasetName, &runCount)
+		var x expRow
+		rows.Scan(&x.id, &x.name, &x.datasetID, &x.baseline, &x.status, &x.summary, &x.created,
+			&x.datasetVersionID, &x.promptVersionID, &x.datasetName)
+		expRows = append(expRows, x)
+		ids = append(ids, x.id)
+	}
+	// Run counts live in the telemetry plane, so they are merged in Go rather
+	// than joined across two SQLite files.
+	counts := map[string]int{}
+	if len(ids) > 0 {
+		ph := strings.TrimSuffix(strings.Repeat("?,", len(ids)), ",")
+		args := make([]interface{}, len(ids))
+		for i, id := range ids {
+			args[i] = id
+		}
+		if crows, err := s.Telemetry.Query(`SELECT experiment_id, COUNT(*) FROM eval_runs
+			WHERE experiment_id IN (`+ph+`) GROUP BY experiment_id`, args...); err == nil {
+			for crows.Next() {
+				var id string
+				var n int
+				if crows.Scan(&id, &n) == nil {
+					counts[id] = n
+				}
+			}
+			crows.Close()
+		}
+	}
+	out := []map[string]interface{}{}
+	for _, x := range expRows {
 		out = append(out, map[string]interface{}{
-			"id": id, "name": name, "dataset_id": datasetID, "dataset_name": datasetName,
-			"baseline_experiment_id": baseline.String, "status": status,
-			"dataset_version_id": datasetVersionID, "prompt_version_id": promptVersionID,
-			"summary": parseJSONPtr(summary.String), "created_at": created, "run_count": runCount,
+			"id": x.id, "name": x.name, "dataset_id": x.datasetID, "dataset_name": x.datasetName,
+			"baseline_experiment_id": x.baseline.String, "status": x.status,
+			"dataset_version_id": x.datasetVersionID, "prompt_version_id": x.promptVersionID,
+			"summary": parseJSONPtr(x.summary.String), "created_at": x.created, "run_count": counts[x.id],
 		})
 	}
 	writeJSON(w, 200, out)
@@ -1107,7 +1274,7 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request, _ string,
 	}
 	baselineID := r.URL.Query().Get("baseline_id")
 	base := map[string]map[string]interface{}{}
-	rows, err := s.DB.Query(`SELECT input, output, expected, scores FROM eval_runs WHERE experiment_id=?`, baselineID)
+	rows, err := s.Telemetry.Query(`SELECT input, output, expected, scores FROM eval_runs WHERE experiment_id=?`, baselineID)
 	if err == nil {
 		for rows.Next() {
 			var input, output, expected, scores string
@@ -1119,7 +1286,7 @@ func (s *Server) handleCompare(w http.ResponseWriter, r *http.Request, _ string,
 		}
 		rows.Close()
 	}
-	rows, err = s.DB.Query(`SELECT input, output, expected, scores, error, latency_ms, output_mode FROM eval_runs WHERE experiment_id=?`, expID)
+	rows, err = s.Telemetry.Query(`SELECT input, output, expected, scores, error, latency_ms, output_mode FROM eval_runs WHERE experiment_id=?`, expID)
 	if err != nil {
 		errJSON(w, 500, err.Error())
 		return
@@ -1193,17 +1360,21 @@ func (s *Server) handleWorkerCallback(w http.ResponseWriter, r *http.Request, _ 
 		errJSON(w, 400, err.Error())
 		return
 	}
-	s.dbMu.Lock()
-	tx, err := s.DB.Begin()
+	// Results are append-heavy telemetry; the experiment status is control
+	// state. They are written in two steps (telemetry commit, then control
+	// update) because the two planes are separate SQLite files. The callback is
+	// idempotent, so a retry safely replaces the runs.
+	s.telemetryMu.Lock()
+	tx, err := s.Telemetry.Begin()
 	if err != nil {
-		s.dbMu.Unlock()
+		s.telemetryMu.Unlock()
 		errJSON(w, 500, err.Error())
 		return
 	}
 	// The callback is idempotent: a re-dispatched or retried worker must replace
 	// its experiment's runs instead of appending a second copy.
 	if _, err := tx.Exec(`DELETE FROM eval_runs WHERE experiment_id=?`, expID); err != nil {
-		s.dbMu.Unlock()
+		s.telemetryMu.Unlock()
 		errJSON(w, 500, err.Error())
 		return
 	}
@@ -1214,13 +1385,21 @@ func (s *Server) handleWorkerCallback(w http.ResponseWriter, r *http.Request, _ 
 			jsonOrNull(run.Output), jsonOrNull(run.Error), run.LatencyMS, j(run.Scores),
 			run.OutputMode, time.Now().UTC().Format(time.RFC3339Nano))
 	}
-	tx.Exec(`UPDATE experiments SET summary=?, status=? WHERE id=?`, j(in.Summary), in.Status, expID)
 	if err := tx.Commit(); err != nil {
-		s.dbMu.Unlock()
+		s.telemetryMu.Unlock()
 		errJSON(w, 500, err.Error())
 		return
 	}
+	s.telemetryMu.Unlock()
+
+	s.dbMu.Lock()
+	_, err = s.DB.Exec(`UPDATE experiments SET summary=?, status=? WHERE id=?`, j(in.Summary), in.Status, expID)
 	s.dbMu.Unlock()
+	if err != nil {
+		s.log.Error("worker callback control update", "experiment_id", expID, "err", err)
+		errJSON(w, 500, "could not update experiment")
+		return
+	}
 	writeJSON(w, 200, map[string]string{"ok": "true"})
 }
 
@@ -1228,6 +1407,9 @@ func (s *Server) handleWorkerCallback(w http.ResponseWriter, r *http.Request, _ 
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request, _ ...string) {
 	ok := s.DB.Ping() == nil
+	if s.Telemetry != nil && s.Telemetry.Ping() != nil {
+		ok = false
+	}
 	jobs := map[string]int{}
 	if s.queue != nil {
 		jobs = s.queue.Counts()

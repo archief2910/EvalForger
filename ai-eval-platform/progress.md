@@ -2,11 +2,11 @@
 
 ## Current State
 
-**Last Updated:** 2026-10-23 21:40
-**Active Feature:** none — feat-001/003/004/006/007/010 complete; feat-002/005/008/009 remain
-**Session Goal:** Finish the monolith → idiomatic Go restructure, then close the highest-value
-product gaps (dataset snapshots, prompt pinning, token provenance) without regressing the
-existing platform.
+**Last Updated:** 2026-10-26
+**Active Feature:** none — feat-001/003/004/006/007/010/011 complete; feat-002/005/008/009 remain
+**Session Goal:** Add first-class conversations (threads) with thread-level scoring and a
+control-plane/data-plane storage split, while preserving every existing EvalForge behavior and
+test suite.
 
 ## Status
 
@@ -55,6 +55,37 @@ existing platform.
 - [x] **Bootstrap.** `--create-key` keeps stdout clean (structured logs are suppressed), so a
       shell capture only receives the key.
 
+#### Conversations & control/data plane split (feat-011)
+
+- [x] **Two SQLite planes.** `data/control.db` owns projects, datasets/versions/records, prompts,
+      experiments, scorers, model prices, jobs, API keys/OAuth and feedback definitions.
+      `data/telemetry.db` owns spans, feedback, eval_runs, threads and thread_scores. Handlers
+      read one plane and merge in Go; there are no cross-file write transactions.
+- [x] **Upgrade path.** A pre-split `data/ai_eval.db` is adopted once: copied to `control.db`,
+      telemetry imported into `telemetry.db`, legacy telemetry tables dropped from control, and
+      every historical trace backfilled into a one-turn conversation. The old file is left intact.
+- [x] **Thread identity and lifecycle.** Native ingest and OTLP accept an explicit `thread_id`;
+      absent it, the trace id becomes a one-turn thread, so every trace belongs to a conversation.
+      Threads are `open`/`closed`, rebuilt after each ingest, closed by an idle sweeper
+      (`THREAD_IDLE_SECONDS`, default 1800 s), and reopened by new activity. Manual close/open
+      endpoints exist.
+- [x] **Thread scoring.** `thread_scores` is separate from per-trace feedback. Manual scores and
+      worker scores coexist; the detail API returns a per-scorer average, recent scores and
+      evaluation history.
+- [x] **Thread evaluators.** Deterministic `thread_completion`, `thread_error_free`,
+      `thread_turn_consistency`, plus LLM `thread_coherence_judge` and
+      `thread_context_retention_judge`. Evaluations run through the durable queue as
+      `kind='thread_eval'`; the worker callback is idempotent per job. LLM judges fall back to
+      deterministic heuristics (labelled `heuristic_fallback`) when the provider is missing **or**
+      returns an error.
+- [x] **UI.** New Conversations list and conversation detail (turn timeline, scores, manual
+      scoring, evaluation history, close/reopen/evaluate). Dashboard shows conversation counts,
+      turn/duration averages and score aggregates. Traces list has a conversation column and
+      `?thread_id=` filter; trace detail links back to its conversation.
+- [x] **Demo seed.** Upgrade-aware: if the demo project exists without multi-turn conversations,
+      it adds 8 three-turn conversations and sample conversation scores instead of exiting or
+      duplicating prompts/datasets. One conversation runs a real worker evaluation.
+
 #### Documentation / harness
 
 - [x] `AGENTS.md`, `README.md`, `docs/ARCHITECTURE.md` updated for the package layout and
@@ -65,11 +96,8 @@ existing platform.
 ### What's In Progress
 
 - [ ] feat-009 (Go httptest suite): broad coverage exists for auth/OAuth, MCP, OTLP, dataset
-      snapshots, prompt pinning, token provenance and scoped access, but the 80% route-coverage
-      target has not been measured.
-- [ ] Working tree is not committed yet. Unrelated tracked deletions under
-      `../horizontal-scaling-with-read-replicas/` were present before this work and must not be
-      committed.
+      snapshots, prompt pinning, token provenance, conversations and scoped access, but the 80%
+      route-coverage target has not been measured.
 
 ### What's Next
 
@@ -86,20 +114,20 @@ existing platform.
 
 ## Verification Evidence
 
-Run on 2026-10-23 after the final code changes:
+Run on 2026-10-26 after the conversations + dual-plane changes:
 
 | Check | Command | Result |
 |---|---|---|
-| Build | `cd server-go && go build -o evalforge.exe ./cmd/server` | pass |
-| Vet | `cd server-go && go vet ./...` | pass |
-| Go tests | `cd server-go && go test ./... -count=1` | pass (3 consecutive runs) |
-| Smoke | `python scripts/smoke_api.py` | 31/31 |
+| Build | `cd server-go && go build ./...` | pass |
+| Go tests | `cd server-go && go test ./... -count=1 -timeout 180s` | pass (api 5.3s), including `threads_test.go` |
+| Smoke | `python scripts/smoke_api.py` | 41/41 |
 | Auth | `python scripts/auth_test.py` | 44/44 |
 | MCP | `python scripts/mcp_test.py` | 23/23 |
 | Fault | `python scripts/fault_test.py` | 16/16 (crash/restart, timeout, retry) |
-| Load | `python scripts/load_test.py` | 360 traces, 0 errors, ~1,000 spans/s |
+| Load | `python scripts/load_test.py` | 360/360 traces, 0 errors, 46 spans/s (1080 spans) |
 | Frontend | `cd frontend && npm run build` | pass |
-| Auth-required eval | manual run with `AUTH_MODE=required` | completed, 2 runs, snapshot pinned |
+| Demo migration | boot against `data/ai_eval.db` | control/telemetry split; 119 spans, 16 feedback, 25 eval_runs, 36 backfilled threads |
+| Browser | Conversations list/detail, trace filter, trace context bar, evaluate | pass; worker job completed and scores rendered |
 
 ## Decisions Made
 
@@ -116,19 +144,25 @@ Run on 2026-10-23 after the final code changes:
   exists in the worker child environment.
 - **404, not 403, for cross-project by-id access.** A scoped credential cannot confirm that
   another project's resource exists.
+- **Control and telemetry are separate SQLite files, merged in Go.** The split is physical, not
+  just logical: each file can be backed up, vacuumed, retained or moved independently. Joins across
+  planes are forbidden, which keeps a future ClickHouse/Postgres telemetry migration honest.
+- **A trace is one turn; `thread_id` groups turns.** Explicit ids come from ingest/OTLP; the
+  trace-id fallback guarantees every trace is addressable as a conversation. The server does not
+  guess a conversation from user/session metadata.
+- **Thread evaluations use the same durable queue as experiments.** `kind='thread_eval'` jobs
+  survive restarts and the callback replaces a job's scores on retry, so redelivery is idempotent.
 
 ## Blockers / Risks
 
 - **Unrelated working-tree deletions.** `horizontal-scaling-with-read-replicas/` is gone from
   disk and shows as deleted in the parent repo. This session did not delete it. Do not stage
   those paths; restore from git only if the user confirms.
-- **Untracked harness files** (`AGENTS.md`, `feature_list.json`, `progress.md`, `init.sh`,
-  `session-handoff.md`) and `server-go/{cmd,internal}/` still need to be added on commit.
 - **feat-002/005/008 are real gaps**, not polish: handlers still surface some raw SQL errors,
-  and scorers are still Go literals. The product works, but these are the next architectural
-  steps.
-- **SQLite single-writer assumption** remains. The queue is crash-safe but not multi-instance
-  coordinated; a second server would need lease-clock tuning and a shared writer.
+  scorers are still Go literals, and handlers still issue SQL directly despite the physical plane
+  split. The product works, but these are the next architectural steps.
+- **SQLite single-writer assumption** remains per file. The queue is crash-safe but not
+  multi-instance coordinated; a second server would need lease-clock tuning and a shared writer.
 - **Windows dev environment.** `init.sh` is bash; PowerShell users can run the same commands
   individually (documented in README/AGENTS).
 
@@ -139,18 +173,25 @@ Run on 2026-10-23 after the final code changes:
 - `server-go/cmd/server/main.go`
 - `server-go/internal/config/config.go`
 - `server-go/internal/logging/logging.go`
-- `server-go/internal/database/db.go`, `migrations/0001_init.sql`, `migrations/0002_product.sql`
+- `server-go/internal/database/{db,migrate,legacy}.go`
+- `server-go/internal/database/migrations/control/{0001_init,0002_product,0003_thread_jobs}.sql`
+- `server-go/internal/database/migrations/telemetry/{0001_init,0002_threads}.sql`
 - `server-go/internal/model/*.go`
 - `server-go/internal/queue/queue.go`
 - `server-go/internal/worker/client.go`
-- `server-go/internal/api/{server,router,handlers,auth,middleware,otlp,mcp,mcp_http,versioning}.go`
-- `server-go/internal/api/{helpers,auth,otlp,versioning}_test.go`
+- `server-go/internal/api/{server,router,handlers,auth,middleware,otlp,mcp,mcp_http,versioning,threads}.go`
+- `server-go/internal/api/{helpers,auth,otlp,versioning,threads}_test.go`
+- `frontend/src/pages/{Conversations,ThreadDetail}.jsx`
 
 ### Modified
 
-- `worker-py/worker.py` — internal token, dataset-version fetch, prompt rendering
-- `frontend/src/pages/{DatasetDetail,ExperimentDetail,TraceDetail}.jsx`
-- `scripts/{smoke_api,auth_test,mcp_test,fault_test,load_test}.py` — build path
+- `server-go/cmd/server/main.go` — open both planes, pass them to `api.New`
+- `server-go/internal/config/config.go` — control/telemetry paths + thread idle timeout
+- `server-go/internal/api/handlers.go` — telemetry routing, ingest thread resolution, dashboard metrics
+- `worker-py/worker.py` — thread evaluators, LLM judges, provider-error heuristic fallback
+- `worker-py/seed.py` — upgrade-aware multi-turn conversations and conversation scores
+- `frontend/src/{main.jsx,components/Layout.jsx}`, `frontend/src/pages/{Dashboard,Traces,TraceDetail}.jsx`
+- `scripts/{smoke_api,fault_test}.py` — thread checks and control.db queue reads
 - `README.md`, `docs/ARCHITECTURE.md`, `AGENTS.md`, `init.sh`
 - `feature_list.json`, `progress.md`
 
@@ -161,8 +202,8 @@ Run on 2026-10-23 after the final code changes:
 ## Notes for Next Session
 
 - Start with `./init.sh` (or the equivalent commands) before changing anything.
-- The fastest honest demo path: seed via `worker-py/seed.py`, open the dashboard, promote a
-  trace to a dataset, run an evaluation with a pinned prompt, compare against a baseline, then
-  rerun pinned.
+- The fastest honest demo path: seed via `worker-py/seed.py`, open the dashboard, open a
+  conversation and run its evaluation, promote a trace to a dataset, run an experiment with a
+  pinned prompt, compare against a baseline, then rerun pinned.
 - If continuing the architecture work, do feat-002 first: it makes the handler error surface
   consistent and is a prerequisite for a clean repository layer.

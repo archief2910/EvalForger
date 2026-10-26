@@ -36,12 +36,12 @@
         "feat-001"
       ],
       "status": "done",
-      "evidence": "internal/database/db.go + embedded migrations/0001_init.sql, 0002_product.sql; schema_migrations tracked, each migration transactional, legacy import preserved."
+      "evidence": "internal/database/{db,migrate,legacy}.go + embedded migrations/control/{0001_init,0002_product,0003_thread_jobs}.sql and telemetry/{0001_init,0002_threads}.sql; schema_migrations tracked per plane, each migration transactional, legacy adoption/import preserved."
     },
     {
       "id": "feat-005",
       "name": "Repository Interfaces (MetadataStore + TelemetryStore)",
-      "description": "Define TelemetryStore and MetadataStore interfaces per OPIK_ALIGNMENT D1. SQLite implementations in internal/repository/sqlite/. Both backed by same *sql.DB for now, but swappable. This is what makes a ClickHouse migration possible without rewriting handlers.",
+      "description": "Define TelemetryStore and MetadataStore interfaces per OPIK_ALIGNMENT D1. SQLite implementations in internal/repository/sqlite/. The physical split now exists (control.db + telemetry.db), but handlers still issue SQL directly; extracting interfaces is what makes a ClickHouse migration possible without rewriting them.",
       "dependencies": [
         "feat-001"
       ],
@@ -92,12 +92,23 @@
     {
       "id": "feat-010",
       "name": "Smoke & Regression Test Pass",
-      "description": "All existing test suites pass after restructure: smoke_api.py (31), auth_test.py (44), mcp_test.py (23), fault_test.py (16). This gates every merge.",
+      "description": "All existing test suites pass after restructure: smoke_api.py (41), auth_test.py (44), mcp_test.py (23), fault_test.py (16). This gates every merge.",
       "dependencies": [
         "feat-009"
       ],
       "status": "done",
-      "evidence": "Go tests green; smoke 31/31; auth 44/44; MCP 23/23; fault 16/16 (crash/restart, timeout, retry); load 360 traces, 0 errors, ~1000 spans/s ingest."
+      "evidence": "Go tests green (incl. threads_test.go); smoke 41/41; auth 44/44; MCP 23/23; fault 16/16 (crash/restart, timeout, retry); load 360 traces, 0 errors."
+    },
+    {
+      "id": "feat-011",
+      "name": "Conversations + Control/Data Plane Split",
+      "description": "Make conversations (threads) first-class: thread_id on ingest, open/closed lifecycle with idle sweep, thread-level scores and evaluators, conversation UI and dashboard metrics. Split storage into control.db (metadata/datasets/experiments/prompts/jobs/auth) and telemetry.db (spans/feedback/eval_runs/threads/thread_scores) with one-time legacy adoption and per-plane retention.",
+      "dependencies": [
+        "feat-001",
+        "feat-004"
+      ],
+      "status": "done",
+      "evidence": "server-go/internal/api/threads.go + threads_test.go; dual-plane database/{db,legacy,migrate}.go; control+telemetry migrations; thread job kind and worker thread callback; five thread scorers; Conversations/ThreadDetail pages; dashboard conversation metrics. Verified: go test ./... green, smoke 41/41, auth 44/44, MCP 23/23, fault 16/16, load 360/360 traces, browser checks on conversation list/detail/trace filter/evaluate."
     }
   ]
 }

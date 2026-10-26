@@ -20,12 +20,18 @@ const (
 	StatusRunning = "running"
 	StatusDone    = "done"
 	StatusFailed  = "failed"
+
+	// KindEval is a dataset experiment. KindThreadEval scores one conversation.
+	KindEval       = "eval"
+	KindThreadEval = "thread_eval"
 )
 
 // Job is one claimable unit of work.
 type Job struct {
 	ID           string
+	Kind         string
 	ExperimentID string
+	ThreadID     string
 	ProjectID    string
 	Payload      string
 	Attempts     int
@@ -67,8 +73,20 @@ func (q *Queue) EnqueueEvalTx(ctx context.Context, tx *sql.Tx, expID, projectID 
 	_, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, kind, experiment_id, project_id, payload, status,
 		attempts, max_attempts, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,0,2,?,?)`,
-		model.NowUTC(), "eval", expID, projectID, string(payload), StatusQueued, ts, ts)
+		model.NewID(), KindEval, expID, projectID, string(payload), StatusQueued, ts, ts)
 	return err
+}
+
+// EnqueueThreadEvalTx writes a conversation-scoring job. Thread jobs carry no
+// experiment; experiment_id stays empty and thread_id is the routing key.
+func (q *Queue) EnqueueThreadEvalTx(ctx context.Context, tx *sql.Tx, projectID, threadID string, payload []byte) (string, error) {
+	ts := model.NowUTC()
+	id := model.NewID()
+	_, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, kind, experiment_id, project_id, thread_id, payload, status,
+		attempts, max_attempts, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,?,0,2,?,?)`,
+		id, KindThreadEval, "", projectID, threadID, string(payload), StatusQueued, ts, ts)
+	return id, err
 }
 
 // Start owns the dispatcher loop and its reaper ticker.
@@ -136,16 +154,20 @@ func (q *Queue) execute(ctx context.Context, j *Job) {
 
 	case out.TimedOut:
 		q.mark(j.ID, StatusFailed, out.Diagnostic)
-		q.retire(j.ExperimentID, out.Diagnostic)
+		if j.Kind == KindEval {
+			q.retire(j.ExperimentID, out.Diagnostic)
+		}
 
 	case j.Attempts < j.MaxAttempts:
 		q.mark(j.ID, StatusQueued, out.Diagnostic)
-		q.log.Warn("job will retry", "job_id", j.ID, "attempt", j.Attempts, "max", j.MaxAttempts, "err", trimForLog(out.Diagnostic))
+		q.log.Warn("job will retry", "job_id", j.ID, "kind", j.Kind, "attempt", j.Attempts, "max", j.MaxAttempts, "err", trimForLog(out.Diagnostic))
 
 	default:
 		q.mark(j.ID, StatusFailed, out.Diagnostic)
-		q.retire(j.ExperimentID, out.Diagnostic)
-		q.log.Error("job failed", "job_id", j.ID, "attempts", j.Attempts, "err", trimForLog(out.Diagnostic))
+		if j.Kind == KindEval {
+			q.retire(j.ExperimentID, out.Diagnostic)
+		}
+		q.log.Error("job failed", "job_id", j.ID, "kind", j.Kind, "attempts", j.Attempts, "err", trimForLog(out.Diagnostic))
 	}
 }
 
@@ -179,8 +201,8 @@ func (q *Queue) claim(now time.Time) (*Job, error) {
 	}
 
 	var j Job
-	err = q.db.QueryRow(`SELECT id, experiment_id, project_id, payload, attempts, max_attempts
-		FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.ExperimentID, &j.ProjectID, &j.Payload, &j.Attempts, &j.MaxAttempts)
+	err = q.db.QueryRow(`SELECT id, kind, experiment_id, COALESCE(thread_id,''), project_id, payload, attempts, max_attempts
+		FROM jobs WHERE id=?`, id).Scan(&j.ID, &j.Kind, &j.ExperimentID, &j.ThreadID, &j.ProjectID, &j.Payload, &j.Attempts, &j.MaxAttempts)
 	if err != nil {
 		return nil, err
 	}
