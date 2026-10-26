@@ -65,24 +65,6 @@ test suite.
 - [x] **Upgrade path.** Historical SQLite data is transported once into the new engines and every
       historical trace is backfilled into a one-turn conversation. The SQLite files are left intact.
 
-#### Storage engines: PostgreSQL + DuckDB (feat-012)
-
-- [x] **Control plane on PostgreSQL.** `CONTROL_DB_URL` + `CONTROL_DB_SCHEMA`, pgx driver, statements
-      keep `?` and `internal/pgbind` rewrites them to `$1..$n` at the driver boundary (including inside
-      transactions). Migrations are applied statement-by-statement in one transaction; a private
-      schema per test/harness run is created and dropped automatically.
-- [x] **Telemetry on DuckDB.** `TELEMETRY_DB_PATH` (default `data/telemetry.duckdb`), one connector and
-      a bounded pool, columnar scans for dashboards, BIGINT millisecond columns (SQLite's INTEGER was
-      dynamically typed and hid the overflow).
-- [x] **One-time transport.** `internal/database/import.go` reads `ai_eval.db`, `telemetry.db` and
-      `control.db` (or `LEGACY_DB`) read-only, routes the whitelisted tables per plane, inserts with
-      `ON CONFLICT DO NOTHING`, and records each file in `import_state`. Verified against the demo data:
-      245 spans, 28 feedback, 25 eval runs, 56 conversations, 28 scores, plus all control rows.
-- [x] **Harness isolation.** Since PostgreSQL is not inside `DATA_DIR`, each Go test and each Python
-      harness pins its own schema; `scripts/_pg.py` creates/drops it, and `fault_test.py` inspects job
-      rows through psql while the server is deliberately down.
-- [x] **Verified:** `go test ./...`, smoke **41/41**, auth **44/44**, MCP **23/23**, fault **16/16**,
-      load **PASS** (360/360 traces, 0 errors), each against PostgreSQL + DuckDB.
 - [x] **Thread identity and lifecycle.** Native ingest and OTLP accept an explicit `thread_id`;
       absent it, the trace id becomes a one-turn thread, so every trace belongs to a conversation.
       Threads are `open`/`closed`, rebuilt after each ingest, closed by an idle sweeper
@@ -104,6 +86,46 @@ test suite.
 - [x] **Demo seed.** Upgrade-aware: if the demo project exists without multi-turn conversations,
       it adds 8 three-turn conversations and sample conversation scores instead of exiting or
       duplicating prompts/datasets. One conversation runs a real worker evaluation.
+
+#### Storage engines: PostgreSQL + DuckDB (feat-012)
+
+- [x] **Control plane on PostgreSQL.** `CONTROL_DB_URL` + `CONTROL_DB_SCHEMA`, pgx driver, statements
+      keep `?` and `internal/pgbind` rewrites them to `$1..$n` at the driver boundary (including inside
+      transactions). Migrations are applied statement-by-statement in one transaction; a private
+      schema per test/harness run is created and dropped automatically.
+- [x] **Telemetry on DuckDB.** `TELEMETRY_DB_PATH` (default `data/telemetry.duckdb`), one connector and
+      a bounded pool, columnar scans for dashboards, BIGINT millisecond columns (SQLite's INTEGER was
+      dynamically typed and hid the overflow).
+- [x] **One-time transport.** `internal/database/import.go` reads `ai_eval.db`, `telemetry.db` and
+      `control.db` (or `LEGACY_DB`) read-only, routes the whitelisted tables per plane, inserts with
+      `ON CONFLICT DO NOTHING`, and records each file in `import_state`. Verified against the demo data:
+      245 spans, 28 feedback, 25 eval runs, 56 conversations, 28 scores, plus all control rows.
+- [x] **Harness isolation.** Since PostgreSQL is not inside `DATA_DIR`, each Go test and each Python
+      harness pins its own schema; `scripts/_pg.py` creates/drops it, and `fault_test.py` inspects job
+      rows through psql while the server is deliberately down.
+- [x] **Verified:** `go test ./...`, smoke **48/48**, auth **44/44**, MCP **23/23**, fault **16/16**,
+      load **PASS** (360/360 traces, 0 errors), each against PostgreSQL + DuckDB.
+#### Online evaluation: rules over live traffic (feat-013)
+
+- [x] **Rules.** `online_rules` (PostgreSQL) holds a project-scoped rule: name, enabled, sample rate,
+      root-status/model/name filters, scorer names and an alert threshold. Validation accepts only
+      `scope=record` scorers from the registry, so there is still no path from the API to arbitrary code.
+- [x] **Automatic scoring on ingest.** Native and OTLP ingest project the committed batch into
+      `{trace, root name, status, models}`; matching costs no extra query. Scoring runs off the request
+      path in a bounded pool (`ONLINE_CONCURRENCY`, `ONLINE_TIMEOUT_SECONDS`).
+- [x] **Deterministic sampling + idempotency.** `hash(rule_id|trace_id) < sample_rate`; a trace already
+      scored for a rule is skipped before the worker starts; `online_scores` is unique on
+      `(rule_id, trace_id, scorer)`, and alerts are written only for an inserted score.
+- [x] **Worker mode.** `worker.py --online --trace-id ... --scorers ...` reads the stored trace, resolves
+      scorer kinds, and prints one JSON document; progress stays on stderr, so the server parses without
+      a new callback endpoint.
+- [x] **Alerts.** Score below threshold → `online_alerts` (PostgreSQL) with `open/acknowledged` state.
+      `POST /alerts/{id}/ack` is idempotent; acknowledged alerts remain as an audit trail.
+- [x] **Surface.** CRUD rules, manual "score this trace" run, alerts list/ack, `online_scores` on the
+      trace view, dashboard block, and an **Online evaluation** page (rules table, create form,
+      pause/resume/delete, open alerts).
+- [x] **Verified:** Go tests cover matching/sampling, ingest-triggered scoring, alerts, ack, filters,
+      sampling=0, disabled rules and PATCH merge; smoke **48/48** against the real worker.
 
 #### Documentation / harness
 

@@ -32,10 +32,14 @@ type Config struct {
 	WorkerTimeout time.Duration
 	JobLease      time.Duration
 	ThreadIdle    time.Duration
-	PythonBin     string
-	LegacyDB      string
-	MCPAPIBase    string
-	MCPAPIKey     string
+	// Online evaluation runs off the ingest path. Concurrency bounds provider
+	// load; Timeout bounds one trace so a slow judge cannot pin a slot forever.
+	OnlineConcurrency int
+	OnlineTimeout     time.Duration
+	PythonBin         string
+	LegacyDB          string
+	MCPAPIBase        string
+	MCPAPIKey         string
 
 	// ServerBaseURL is the origin this process is reachable at, derived from
 	// Addr unless overridden. The worker and MCP client use it to call back.
@@ -48,17 +52,19 @@ func Load() (Config, error) {
 	LoadDotEnv()
 
 	c := Config{
-		Addr:          env("ADDR", ":8000"),
-		DataDir:       env("DATA_DIR", filepath.Join("..", "data")),
-		AuthMode:      strings.ToLower(env("AUTH_MODE", "off")),
-		PublicBaseURL: strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
-		WorkerPath:    env("WORKER_PATH", filepath.Join("..", "worker-py", "worker.py")),
-		WorkerTimeout: 12 * time.Minute,
-		JobLease:      45 * time.Second,
-		ThreadIdle:    30 * time.Minute,
-		PythonBin:     env("PYTHON_BIN", "python"),
-		LegacyDB:      os.Getenv("LEGACY_DB"),
-		MCPAPIKey:     os.Getenv("MCP_API_KEY"),
+		Addr:              env("ADDR", ":8000"),
+		DataDir:           env("DATA_DIR", filepath.Join("..", "data")),
+		AuthMode:          strings.ToLower(env("AUTH_MODE", "off")),
+		PublicBaseURL:     strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		WorkerPath:        env("WORKER_PATH", filepath.Join("..", "worker-py", "worker.py")),
+		WorkerTimeout:     12 * time.Minute,
+		JobLease:          45 * time.Second,
+		ThreadIdle:        30 * time.Minute,
+		OnlineConcurrency: 2,
+		OnlineTimeout:     3 * time.Minute,
+		PythonBin:         env("PYTHON_BIN", "python"),
+		LegacyDB:          os.Getenv("LEGACY_DB"),
+		MCPAPIKey:         os.Getenv("MCP_API_KEY"),
 	}
 
 	// Two engines, matching the plane split: PostgreSQL holds the small,
@@ -87,6 +93,20 @@ func Load() (Config, error) {
 			return Config{}, fmt.Errorf("THREAD_IDLE_SECONDS must be a positive integer, got %q", v)
 		}
 		c.ThreadIdle = time.Duration(n) * time.Second
+	}
+	if v := os.Getenv("ONLINE_CONCURRENCY"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 || n > 32 {
+			return Config{}, fmt.Errorf("ONLINE_CONCURRENCY must be an integer between 1 and 32, got %q", v)
+		}
+		c.OnlineConcurrency = n
+	}
+	if v := os.Getenv("ONLINE_TIMEOUT_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("ONLINE_TIMEOUT_SECONDS must be a positive integer, got %q", v)
+		}
+		c.OnlineTimeout = time.Duration(n) * time.Second
 	}
 
 	level := env("LOG_LEVEL", "info")

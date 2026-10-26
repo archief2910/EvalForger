@@ -14,7 +14,7 @@ export function Sidebar() {
     <aside className="sidebar">
       <Link to="/" style={{ display: "block", marginBottom: 4 }}>
         <div style={{ fontWeight: 700, fontSize: 15, color: "var(--text)" }}>EvalForge</div>
-        <div style={{ color: "var(--muted)", fontSize: 11 }}>trace → review → eval</div>
+        <div style={{ color: "var(--muted)", fontSize: 11 }}>trace → review → eval → online</div>
       </Link>
       {!pid && (
         <>
@@ -31,6 +31,7 @@ export function Sidebar() {
           <NavLink className="nav-item" to={`/projects/${pid}`} end={loc.pathname === `/projects/${pid}`}>Dashboard</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/traces`}>Logs &amp; Traces</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/conversations`}>Conversations</NavLink>
+          <NavLink className="nav-item" to={`/projects/${pid}/online`}>Online evaluation</NavLink>
           <div className="nav-group">Evaluate</div>
           <NavLink className="nav-item" to={`/projects/${pid}/datasets`}>Datasets</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/experiments`}>Experiments</NavLink>

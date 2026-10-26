@@ -18,7 +18,7 @@ cd ..
 
 # ---------- Smoke Tests ----------
 echo ""
-echo "=== Running smoke tests (41 checks) ==="
+echo "=== Running smoke tests (48 checks) ==="
 python scripts/smoke_api.py
 echo "Smoke tests OK"
 

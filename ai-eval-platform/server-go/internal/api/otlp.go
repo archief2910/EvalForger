@@ -439,6 +439,13 @@ func (s *Server) handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathPr
 	s.telemetryMu.Unlock()
 
 	s.logf("otlp ingest", "project_id", projectID, "spans", len(rows))
+	s.online.AfterIngest(projectID, batchTraceInfos(rows, func(row model.SpanRow) (string, string, string, string, bool) {
+		status := ""
+		if row.ParentID == "" {
+			status = row.Status
+		}
+		return row.TraceID, row.Name, row.Model, status, row.ParentID == ""
+	}))
 	writeOTLPResponse(w, ct)
 }
 

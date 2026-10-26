@@ -44,8 +44,8 @@ database for metadata and a columnar file for telemetry.
 
 | Engine | Owns | Why |
 |---|---|---|
-| **PostgreSQL** (`CONTROL_DB_URL`, schema `CONTROL_DB_SCHEMA`) | projects, datasets, dataset versions/records, prompts, experiments, scorers, model prices, jobs, API keys/OAuth, feedback definitions | small, relational, transactional; online backup and concurrent writers without a process-wide mutex |
-| **DuckDB** (`TELEMETRY_DB_PATH`, `data/telemetry.duckdb`) | spans, feedback, eval runs, conversations (`threads`), conversation scores | append-heavy, columnar scans for dashboards, backed up as one file, retained independently |
+| **PostgreSQL** (`CONTROL_DB_URL`, schema `CONTROL_DB_SCHEMA`) | projects, datasets, dataset versions/records, prompts, experiments, scorers, model prices, jobs, API keys/OAuth, feedback definitions, **online rules and alerts** | small, relational, transactional; online backup and concurrent writers without a process-wide mutex |
+| **DuckDB** (`TELEMETRY_DB_PATH`, `data/telemetry.duckdb`) | spans, feedback, eval runs, conversations (`threads`), conversation scores, **automatic online scores** | append-heavy, columnar scans for dashboards, backed up as one file, retained independently |
 
 Handlers never join across the planes. They query one engine, then merge in Go, so telemetry can move
 to ClickHouse later without rewriting the product surface. Statements are written once with `?`
@@ -99,7 +99,17 @@ answer. The worker handles that by escalating `max_tokens` and retrying, and rec
 4. **Add to dataset** — one click promotes the trace (`input` copied, `expected` = your corrected answer, `metadata.origin_trace_id` = reference back to the trace).
 5. **Run evaluation** — pick a dataset, select scorers (deterministic + LLM-as-judge), optionally pin a prompt version, choose a baseline experiment → an immutable experiment is created. The dataset is snapshotted first, so later edits cannot change what the run saw.
 6. **Compare** — per-case deltas by input alignment; improvement/regression badges per scorer. **Rerun pinned** reuses the same dataset snapshot and prompt version.
-7. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown, conversation counts and conversation-score averages. Token counts reported by the provider are labelled `provider`; estimates are labelled `estimated` in the trace view.
+7. **Dashboard** — requests, error rate, p50/p95/p99 latency, token/cost totals, model breakdown, conversation counts, conversation-score averages and the online-evaluation block. Token counts reported by the provider are labelled `provider`; estimates are labelled `estimated` in the trace view.
+8. **Online evaluation** — the continuous half of the loop. A rule (`Online evaluation` in the sidebar) matches live traffic on root status/name/model, samples a fraction of matches, runs the selected trace scorers on ingest, and writes an automatic score to the trace. When a score falls below the rule's threshold an alert is raised and can be acknowledged. No dataset promotion is involved; the scores appear on the trace next to human feedback.
+
+```bash
+# a rule that scores every error trace for valid JSON output, alerting below 0.5
+curl -s -X POST localhost:8000/api/v1/projects/$PID/online-rules \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"json guard","scorers":["json_valid"],"sample_rate":1,
+       "filter_status":"error","alert_threshold":0.5}'
+curl -s "localhost:8000/api/v1/projects/$PID/alerts?status=open"
+```
 
 ## API surface (`/api/v1`)
 | Area | Endpoints |
@@ -234,7 +244,7 @@ Expired codes and tokens are scrubbed hourly.
 
 ## Scripts
 ```bash
-python scripts/smoke_api.py     # 41-check contract run on a private server + temp DB (demo data untouched)
+python scripts/smoke_api.py     # 48-check contract run on a private server + private schema (demo data untouched)
 python scripts/auth_test.py     # 44 checks: keys, scopes, PKCE flow, refresh rotation, revocation, MCP auth
 python scripts/fault_test.py    # 16 checks: crash mid-eval, hung worker, worker crash + retry
 python scripts/load_test.py     # concurrent ingest/query benchmark with integrity assertions
@@ -271,6 +281,8 @@ Environment knobs for the server/worker split:
 | `PUBLIC_BASE_URL` | listen address | public origin used in OAuth discovery and token audience (set it behind a proxy) |
 | `WORKER_PATH` | `../worker-py/worker.py` | worker script the server executes |
 | `WORKER_TIMEOUT_SECONDS` | `720` | hard cap per evaluation; a stalled worker is marked `failed` instead of running forever |
+| `ONLINE_CONCURRENCY` | `2` | traces scored at once by online rules; bounds provider load |
+| `ONLINE_TIMEOUT_SECONDS` | `180` | cap per online evaluation, so one slow judge cannot pin a slot |
 | `LOG_LEVEL` | `info` | structured JSON logs (`debug`, `info`, `warn`, `error`) |
 | `GO_SERVER` | `http://localhost:8000` | where the worker calls back to |
 | `MCP_API_BASE` | `http://localhost:8000` | API the stdio MCP server talks to |

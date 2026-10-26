@@ -229,6 +229,28 @@ erDiagram
          int attempts
          text lease_expires_at
          text last_error }
+  online_rules { text id PK          -- control plane
+                  text project_id
+                  int  enabled
+                  real sample_rate
+                  text filter_status
+                  text filter_model
+                  text filter_name
+                  text scorers
+                  real alert_threshold }
+  online_alerts { text id PK         -- control plane
+                   text rule_id
+                   text trace_id
+                   text scorer
+                   real score
+                   real threshold
+                   text status }
+  online_scores { text id PK         -- telemetry plane
+                   text rule_id
+                   text trace_id
+                   text scorer
+                   real score
+                   unique(rule_id, trace_id, scorer) }
 ```
 
 A **trace is not its own table**: the root span (`parent_id IS NULL`) *is* the trace row, and
@@ -320,6 +342,53 @@ cases regressed"* is one tool call plus reasoning, not a browser session.
 per-tool scopes (`read` for the read tools, `write` for `add_feedback` / `run_evaluation`), and a
 project-scoped key stays project-scoped inside the agent. With `AUTH_MODE=off` the endpoint is open by
 design, so keep that deployment on loopback.
+
+---
+
+## 5c. Online evaluation
+
+Experiments are offline: a human chooses a dataset, runs it, compares. Opik adds the other half — rules
+that score production traffic continuously — and that is the difference between a testing tool and a
+monitoring product. We implement the same loop with the scorers that already exist:
+
+```
+POST spans:ingest / OTLP
+      │  (after the transaction commits)
+      ▼
+ rule match ──► sampling ──► worker.py --online ──► online_scores (DuckDB)
+ (status/name/model)  hash(rule,trace)   one subprocess      │
+                                                             ▼
+                                              score < threshold → online_alerts (PostgreSQL)
+```
+
+- **Matching is a projection, not a query.** The ingest handler already knows each trace's root
+  name/status and the models its spans used, so rule matching costs no extra read.
+- **Sampling is deterministic.** `hash(rule_id + trace_id) < sample_rate`. A retried batch makes the
+  same decision, and a trace is never scored twice for one rule (`online_scores` is unique on
+  `(rule_id, trace_id, scorer)`, and the guard runs before the worker starts).
+- **Execution is off the ingest path**, bounded by `ONLINE_CONCURRENCY` workers with
+  `ONLINE_TIMEOUT_SECONDS` per trace. Scoring is the same Python worker as dataset evaluation, in a new
+  `--online` mode: it reads the stored trace, resolves scorer kinds from the registry, and prints one
+  JSON document (progress stays on stderr).
+- **Alerts are control state.** A score below the rule's threshold writes one alert row; it is written
+  only when the score row was actually inserted, so a retry cannot duplicate alerts. Acknowledging sets
+  `status='acknowledged'`; the alert is kept as an audit trail.
+- **The planes stay apart.** Rules and alerts are PostgreSQL rows, scores are DuckDB rows, and the API
+  merges them for the trace view, dashboard block and alerts list.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET/POST /projects/{id}/online-rules` | list / create a rule (scorers, sample rate, filters, threshold) |
+| `GET/PATCH/DELETE /projects/{id}/online-rules/{rule}` | inspect, pause/resume or edit, delete |
+| `POST /projects/{id}/online-rules/{rule}/run` | score one trace on demand, ignoring sampling and filters |
+| `GET /projects/{id}/alerts?status=open` | open (or `all` / `acknowledged`) alerts, joined with rule names |
+| `POST /projects/{id}/alerts/{alert}/ack` | acknowledge an alert (idempotent) |
+
+The trace view (`online_scores`) and the dashboard's online block are built from those same reads.
+**Limits:** rules only see traffic that arrives after they are created; scoring is one subprocess per
+trace, not a streaming evaluator; there is no notification channel (Slack/email) and no
+firing/resolved monitor state beyond acknowledgement. Custom Python scorers are still not accepted —
+the sandbox that would make user code safe is a separate feature (see OPIK_ALIGNMENT D15).
 
 ---
 
@@ -449,8 +518,10 @@ Spawns its own server on a free port with a throw-away `DATA_DIR`, a private Pos
 provider key, then drives ingest → traces → feedback → dashboard → datasets → prompts → evaluation →
 compare. The schema is dropped afterwards; your demo data is never touched.
 
-Result: **41/41 checks**, demo databases untouched. The run now includes multi-turn ingest,
-conversation list/detail, conversation scoring, evaluation queueing, and callback idempotency.
+Result: **48/48 checks**, demo databases untouched. The run includes multi-turn ingest,
+conversation list/detail, conversation scoring, evaluation queueing, callback idempotency, and the
+online loop: rule creation, automatic scoring on ingest, manual scoring, threshold alerting and
+acknowledgement (through the real worker, not a stub).
 
 ### 9.3 Fault injection — does it survive failure?
 

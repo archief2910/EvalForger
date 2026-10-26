@@ -120,6 +120,18 @@
       ],
       "status": "done",
       "evidence": "server-go/internal/database/{db,import,migrate,legacy}.go + internal/pgbind; migrations per plane; imported 245 spans, 28 feedback, 25 eval runs, 56 threads, 28 thread scores and all control rows into the new engines; go test ./... green; smoke 41/41; auth 44/44; MCP 23/23; fault 16/16; load 360/360 traces."
+    },
+    {
+      "id": "feat-013",
+      "name": "Online Evaluation Rules + Alerts",
+      "description": "Score live production traffic without dataset promotion: project-scoped rules with root filters, deterministic sampling, automatic scorer runs on ingest (native + OTLP), threshold alerts with acknowledgement, and a dashboard/UI surface.",
+      "dependencies": [
+        "feat-001",
+        "feat-008",
+        "feat-011"
+      ],
+      "status": "done",
+      "evidence": "internal/online (matching, sampling, bounded engine, idempotent persistence), internal/api/online.go (rules CRUD, manual run, alerts/ack, dashboard block), worker --online mode, frontend Online page; Go tests for matching/sampling/scoring/alerts/ack/filters/PATCH; smoke 48/48 against the real worker."
     }
   ]
 }

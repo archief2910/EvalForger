@@ -125,6 +125,9 @@ func run(args []string) error {
 	case <-time.After(15 * time.Second):
 		log.Warn("dispatcher still stopping after 15s")
 	}
+	// Online scoring owns subprocesses and detached goroutines; drain them
+	// before the database handles close underneath them.
+	server.StopOnline()
 	log.Info("shutdown complete")
 	return nil
 }

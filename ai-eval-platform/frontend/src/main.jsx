@@ -13,6 +13,7 @@ import DatasetDetail from "./pages/DatasetDetail.jsx";
 import Experiments from "./pages/Experiments.jsx";
 import ExperimentDetail from "./pages/ExperimentDetail.jsx";
 import Prompts from "./pages/Prompts.jsx";
+import Online from "./pages/Online.jsx";
 import { Sidebar } from "./components/Layout.jsx";
 
 function Layout() {
@@ -42,6 +43,7 @@ const router = createBrowserRouter([
       { path: "projects/:pid/experiments", element: <Experiments /> },
       { path: "projects/:pid/experiments/:eid", element: <ExperimentDetail /> },
       { path: "projects/:pid/prompts", element: <Prompts /> },
+      { path: "projects/:pid/online", element: <Online /> },
     ],
   },
 ]);

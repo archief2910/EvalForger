@@ -6,6 +6,9 @@ export const api = {
   get: (p) => fetch(p).then(j),
   post: (p, body) =>
     fetch(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }).then(j),
+  patch: (p, body) =>
+    fetch(p, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) }).then(j),
+  del: (p) => fetch(p, { method: "DELETE" }).then(j),
 };
 
 export const fmt = {

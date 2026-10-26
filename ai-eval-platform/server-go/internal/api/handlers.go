@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"evalforge/internal/model"
+	"evalforge/internal/online"
 )
 
 // ---------- span ingest ----------
@@ -210,7 +211,60 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 		errJSON(w, 500, err.Error())
 		return
 	}
+
+	// Online rules see the batch only after it is durable. Matching uses this
+	// projection, so a rule never has to re-read spans to decide.
+	s.online.AfterIngest(projectID, batchTraceInfos(preps, func(p prep) (string, string, string, string, bool) {
+		status := ""
+		if p.ev.ParentID == "" {
+			status = "ok"
+			if p.ev.Error != nil {
+				status = "error"
+			}
+		}
+		return p.trace, p.ev.Name, p.ev.Model, status, p.ev.ParentID == ""
+	}))
 	writeJSON(w, 200, map[string]interface{}{"inserted": inserted, "traces_created": tracesCreated})
+}
+
+// batchTraceInfos projects an ingest batch into the attributes online rules
+// match on: the root span's name/status and every model the trace used.
+func batchTraceInfos[T any](items []T, describe func(T) (traceID, name, model, status string, isRoot bool)) []online.TraceInfo {
+	type acc struct {
+		info   online.TraceInfo
+		isRoot bool
+	}
+	byTrace := map[string]*acc{}
+	order := []string{}
+	for _, item := range items {
+		traceID, name, model, status, root := describe(item)
+		if traceID == "" {
+			continue
+		}
+		a := byTrace[traceID]
+		if a == nil {
+			a = &acc{info: online.TraceInfo{ID: traceID}}
+			byTrace[traceID] = a
+			order = append(order, traceID)
+		}
+		if model != "" {
+			a.info.Models = append(a.info.Models, model)
+		}
+		if root && !a.isRoot {
+			a.info.Name = name
+			a.info.Status = status
+			a.isRoot = true
+		}
+	}
+	out := make([]online.TraceInfo, 0, len(order))
+	for _, id := range order {
+		info := byTrace[id].info
+		if info.Status == "" {
+			info.Status = "ok"
+		}
+		out = append(out, info)
+	}
+	return out
 }
 
 // ---------- trace queries ----------
@@ -439,6 +493,7 @@ func (s *Server) handleTraceDetail(w http.ResponseWriter, r *http.Request, proje
 	writeJSON(w, 200, map[string]interface{}{
 		"trace_id": traceID, "thread_id": threadID, "thread": thread,
 		"span_tree": roots, "feedback": fb,
+		"online_scores": s.onlineScoresForTrace(r.Context(), projectID, traceID),
 	})
 }
 
@@ -685,6 +740,7 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 		"timeseries":      ts,
 		"threads":         threadStats,
 		"thread_scores":   threadScores,
+		"online":          s.onlineStats(r.Context(), projectID, time.Now().Add(-time.Duration(hours)*time.Hour)),
 	})
 }
 

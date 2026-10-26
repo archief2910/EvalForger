@@ -128,6 +128,39 @@ export default function Dashboard() {
             </div>
           </div>
 
+          <div className="row" style={{ marginTop: 24, justifyContent: "space-between" }}>
+            <h2 style={{ margin: 0 }}>Online evaluation</h2>
+            <Link className="btn ghost" to={`/projects/${pid}/online`}>Open rules →</Link>
+          </div>
+          <p className="sub" style={{ marginTop: 4 }}>Production traces scored automatically, and the alerts those thresholds raised.</p>
+          <div className="grid cols4">
+            <div className="panel stat">
+              <div className="label">Rules enabled</div>
+              <div className="value">
+                {fmt.num(d.online?.rules_enabled)}
+                <span style={{ color: "var(--muted)", fontSize: 13 }}> / {fmt.num(d.online?.rules_total)}</span>
+              </div>
+              <div className="hint">watching live traffic</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Scored in range</div>
+              <div className="value">{fmt.num(d.online?.scored)}</div>
+              <div className="hint">automatic trace evaluations</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Avg online score</div>
+              <div className="value">{d.online?.avg_score == null ? "–" : Number(d.online.avg_score).toFixed(2)}</div>
+              <div className="hint">across every scorer</div>
+            </div>
+            <div className="panel stat">
+              <div className="label">Open alerts</div>
+              <div className="value" style={{ color: d.online?.alerts_open ? "var(--red)" : "var(--green)" }}>
+                {fmt.num(d.online?.alerts_open)}
+              </div>
+              <div className="hint">scores below a rule threshold</div>
+            </div>
+          </div>
+
           <div className="grid cols2" style={{ marginTop: 14 }}>
             <div className="panel">
               <h2 style={{ marginTop: 0 }}>Model breakdown</h2>

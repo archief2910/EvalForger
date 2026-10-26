@@ -307,6 +307,60 @@ step, not a hidden gap.
 ~~The MCP layer is loopback-only until then.~~ With `AUTH_MODE=required`, `POST /mcp` demands a bearer
 token and per-tool scopes; evidence is `scripts/auth_test.py` (44/44).
 
+### D14 — Online evaluation: score live traffic, not only datasets (implemented)
+
+**Opik:** online evaluation rules evaluate production traces continuously — a filter, a sampling rate,
+a set of metrics — and write the scores back to the trace. Alerts/monitors sit on top.
+**Us (before):** every score came from a dataset experiment a human started. Production could regress for
+days without anyone noticing.
+
+**Decision: implement the rule loop with the trusted scorer registry.** A rule stores
+trace filters (root status, model, name substring), a sample rate, scorer names and an alert threshold.
+On ingest — native and OTLP — the handler projects the batch into `{trace, root name, status, models}`,
+matching costs no extra query, and scoring runs **off the request path** in a bounded pool
+(`ONLINE_CONCURRENCY`, `ONLINE_TIMEOUT_SECONDS`).
+
+- **Deterministic sampling:** `hash(rule_id|trace_id) < sample_rate`. Retries and replays make the same
+decision; a partial sample never becomes "score the noisy trace twice".
+- **Idempotent persistence:** `online_scores` is unique on `(rule_id, trace_id, scorer)`, the
+  already-scored check runs before the worker starts, and an alert is written only for a score row that
+  was actually inserted. A retried ingest cannot duplicate scores or alerts.
+- **Execution:** a new `worker.py --online` mode fetches the stored trace, resolves scorer kinds from the
+  registry, runs them, and prints one JSON document (progress stays on stderr). The server writes the
+  rows, so no new callback endpoint or auth window exists.
+- **Planes:** rules/alerts are control rows, scores are telemetry rows; the trace view, the alerts list
+  and the dashboard block merge them in Go, like every other cross-plane read.
+- **Guardrail:** rule validation accepts only `scope=record` scorers from the registry. There is no path
+  from an API request to arbitrary code execution, which is what keeps D15 optional.
+
+**What we deliberately do not copy yet:** Opik's streaming evaluators (we spawn one worker per trace),
+windowed monitors that fire once for an aggregate condition (our alert is per score), and notification
+channels (Slack/email/PagerDuty). Those are product breadth, not protocol.
+
+### D15 — Custom Python metrics need a sandbox (decided, not built)
+
+**Opik:** users write Python metrics, so the backend executes untrusted code. The answer is a disposable
+sandbox: container-per-job, no network, non-root, read-only root filesystem, memory/CPU/PID caps, hard
+timeout.
+**Us:** scorers are a fixed registry executed by a trusted worker. That is safe precisely because users
+cannot upload code.
+
+**Decision: do not accept custom code until the sandbox exists, and build it when the feature demands it.**
+The shape is recorded now so it cannot be hand-waved later:
+
+1. `Scorer` stays the execution boundary (online and dataset paths both use it). A sandboxed backend
+   implements the same interface; matching, persistence and API do not change.
+2. Docker flags: `--network none --read-only --user 65534:65534 --memory 256m --pids-limit 64
+   --cpus 1 --cap-drop ALL --security-opt no-new-privileges`, plus a wall-clock timeout and no secrets in
+   the container environment.
+3. The local fallback exists for development and **must fail closed** for untrusted code: it refuses to
+   run uploaded scorers unless an explicit opt-in is set, and the UI/API say so. A hardened subprocess
+   with a timeout is not a security boundary.
+
+Not implemented in this pass because no customer-code path exists; adding the container backend without
+that requirement would be untested infrastructure. Verified today instead: rules cannot name a scorer
+outside the registry (400), which keeps the trusted boundary real.
+
 ### D12 — Reject these, with reasons
 
 | Opik pattern | Why not here |
@@ -413,8 +467,8 @@ Ordered by *what makes the product real*, not by what is fun to build. Each item
 |---|---|---|
 | 10 | Embedded DuckDB telemetry | ClickHouse behind the same plane boundary; migration documented and benchmarked |
 | 11 | No retention | Per-project retention rule deletes spans older than N days on a schedule; dashboard reflects it |
-| 12 | No online evaluation | A rule "on every new trace in project X, run scorer Y" produces scores without a human |
-| 13 | No alerting | A monitor on `error_rate > 5%` for 15 min fires once, not per span |
+| 12 | ~~No online evaluation~~ **done** | A rule "on every new trace in project X, run scorer Y" produces scores without a human — implemented (`online_rules`, `online_scores`, `--online` worker mode) |
+| 13 | Alerting is threshold-only | Score-below-threshold alerts exist; a windowed monitor (`error_rate > 5%` for 15 min, fires once) does not |
 | 14 | No OpenAPI contract | `openapi.json` generated from handlers; a TS client generated from it compiles in CI |
 | 15 | No metering | Spans ingested, scores computed, and bytes stored are attributable per workspace per day |
 
@@ -424,8 +478,9 @@ Ordered by *what makes the product real*, not by what is fun to build. Each item
 
 - **Annotation queues** (human review workflow with locking — see `AnnotationQueueItemLockService`). Ours is a thumbs
   button; review is a queue, a routing rule, and an audit trail.
-- **Automation rules / online evaluators**: score new traces automatically, keyed by filters.
-- **Alerts + monitors** with state (firing/resolved), not just a dashboard number.
+- **Automation rules / online evaluators**: implemented in D14 — filters, sampling, automatic scores.
+- **Alerts + monitors** with state (firing/resolved): score-threshold alerts are implemented; aggregate,
+  windowed monitors are not.
 - **Optimizations** (prompt/agent optimization loops) — Opik has a whole Python package; we have nothing.
 - **Attachments** (images, audio, JSON blobs) on spans — needs object storage.
 - **Workspaces + RBAC + API keys** — the actual boundary that makes "multi-tenant" true.

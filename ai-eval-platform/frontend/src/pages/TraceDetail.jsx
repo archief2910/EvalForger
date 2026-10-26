@@ -152,6 +152,28 @@ export default function TraceDetail() {
             </div>
           )}
 
+          {(d.online_scores || []).length > 0 && (
+            <div className="card">
+              <b>Online scores</b>
+              <table style={{ marginTop: 8 }}>
+                <tbody>
+                  {d.online_scores.map((s, i) => (
+                    <tr key={i}>
+                      <td>
+                        <span className={"pill " + (s.score == null ? "" : s.score < 0.5 ? "error" : "ok")}>
+                          {s.scorer}
+                        </span>
+                      </td>
+                      <td>{s.score == null ? "no score" : Number(s.score).toFixed(2)}</td>
+                      <td style={{ color: "var(--muted)" }}>{s.rule_name}</td>
+                      <td style={{ color: "var(--muted)", fontSize: 11 }}>{s.rationale}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
           {fb.length > 0 && (
             <div className="card">
               <b>Feedback history</b>

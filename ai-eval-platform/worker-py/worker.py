@@ -485,6 +485,46 @@ def generate_task(record_input, task_mode, salt, prompt_template=None):
     return _simulate_output(record_input, None, salt=salt), None, "simulated_fallback"
 
 
+# ---------------- online evaluation ----------------
+
+def _as_text(v):
+    if v is None:
+        return ""
+    if isinstance(v, str):
+        return v
+    return json.dumps(v, ensure_ascii=False)
+
+
+def run_online(args):
+    """Score one live trace for an online rule and print the result as JSON.
+
+    The server owns rule matching, sampling and persistence; this mode only
+    executes the scorers the rule selected. Progress goes to stderr and the
+    single JSON document to stdout, so the caller needs no callback protocol.
+    """
+    if not args.trace_id:
+        raise SystemExit("--trace-id is required with --online")
+    detail = _get(f"/projects/{args.project_id}/traces/{args.trace_id}")
+    roots = detail.get("span_tree") or []
+    if not roots:
+        raise SystemExit(f"trace {args.trace_id} has no spans")
+    root = roots[0]
+    sinput, output = _as_text(root.get("input")), _as_text(root.get("output"))
+    names = [s.strip() for s in (args.scorers or "").split(",") if s.strip()]
+    kinds = {s.get("name"): s.get("kind", "deterministic") for s in _get("/scorers")}
+    results = []
+    for name in names:
+        kind = kinds.get(name)
+        if kind is None:
+            log(f"online: unknown scorer {name}, skipping")
+            continue
+        res = run_scorer(name, kind, {}, sinput, output, "")
+        if res:
+            results.append(res)
+    log(f"online trace={args.trace_id} scorers={len(results)}")
+    print(json.dumps({"scores": results}), flush=True)
+
+
 # ---------------- main ----------------
 
 def main():
@@ -498,9 +538,14 @@ def main():
     ap.add_argument("--baseline-id", default="")
     ap.add_argument("--thread-id", default="")
     ap.add_argument("--job-id", default="")
+    ap.add_argument("--online", action="store_true")
+    ap.add_argument("--trace-id", default="")
     ap.add_argument("--scorers", default="")
     args = ap.parse_args()
 
+    if args.online:
+        run_online(args)
+        return
     if args.thread_id:
         run_thread_eval(args)
         return

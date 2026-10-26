@@ -417,6 +417,65 @@ def run_checks():
     st, cmp_rows = call("GET", f"/api/v1/experiments/{expid}/compare?baseline_id={expid}")
     check("compare endpoint", st == 200 and len(cmp_rows) == 4, f"rows={len(cmp_rows)}")
 
+    # ---- online evaluation: rules score live traffic without a dataset ----
+    st, online_rule = call("POST", f"/api/v1/projects/{pid}/online-rules", {
+        "name": "smoke json guard", "scorers": ["json_valid"], "sample_rate": 1,
+        "alert_threshold": 0.5, "filter_name": "support",
+    })
+    check("online: rule created", st == 200 and online_rule.get("enabled") is True,
+          f"status={st} rule={online_rule.get('id')}")
+
+    st, _ = call("POST", f"/api/v1/projects/{pid}/spans:ingest", {"events": [{
+        "id": "online-trace", "name": "support-agent", "type": "task",
+        "input": "How do I reset my password?",
+        "output": {"answer": "Use the forgot-password link."},
+    }]})
+    check("online: live trace ingested", st == 200, f"status={st}")
+
+    scored = None
+    deadline = time.time() + 60
+    while time.time() < deadline:
+        st, td = call("GET", f"/api/v1/projects/{pid}/traces/online-trace")
+        scores = td.get("online_scores") or []
+        if scores:
+            scored = scores
+            break
+        time.sleep(0.5)
+    check("online: ingest scored automatically",
+          bool(scored) and scored[0].get("scorer") == "json_valid"
+          and scored[0].get("score") == 1.0 and scored[0].get("rule_name") == "smoke json guard",
+          f"scores={scored}")
+
+    st, dash3 = call("GET", f"/api/v1/projects/{pid}/dashboard")
+    online = dash3.get("online") or {}
+    check("online: dashboard reflects rules and scores",
+          st == 200 and online.get("rules_enabled") == 1 and online.get("scored", 0) >= 1,
+          f"online={online}")
+
+    st, alert_rule = call("POST", f"/api/v1/projects/{pid}/online-rules", {
+        "name": "smoke alert rule", "scorers": ["exact_match"], "alert_threshold": 0.5,
+    })
+    st, run = call("POST", f"/api/v1/projects/{pid}/online-rules/{alert_rule.get('id')}/run",
+                   {"trace_id": "online-trace"})
+    check("online: manual run scores on demand",
+          st == 200 and run.get("scores") and run["scores"][0].get("score") == 0.0,
+          f"status={st} scores={run.get('scores')}")
+
+    st, alert_list = call("GET", f"/api/v1/projects/{pid}/alerts")
+    open_alerts = [a for a in (alert_list.get("alerts") or []) if a.get("trace_id") == "online-trace"]
+    check("online: threshold breach raises an alert",
+          st == 200 and len(open_alerts) == 1 and open_alerts[0].get("rule_name") == "smoke alert rule",
+          f"alerts={len(open_alerts)}")
+
+    ack_status, ack = ({}, {})
+    if open_alerts:
+        ack_status, ack = call("POST", f"/api/v1/projects/{pid}/alerts/{open_alerts[0]['id']}/ack")
+    st, alert_list2 = call("GET", f"/api/v1/projects/{pid}/alerts")
+    still_open = [a for a in (alert_list2.get("alerts") or []) if a.get("trace_id") == "online-trace"]
+    check("online: alert can be acknowledged",
+          ack_status == 200 and ack.get("status") == "acknowledged" and not still_open,
+          f"ack={ack} still_open={len(still_open)}")
+
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     for name, _, detail in failed:

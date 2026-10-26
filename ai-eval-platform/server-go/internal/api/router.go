@@ -85,6 +85,16 @@ func (s *Server) Router() http.Handler {
 			s.handleThreadScores(w, r, projectID, rest[1])
 		case len(rest) == 3 && rest[0] == "threads" && rest[2] == "evaluate":
 			s.handleThreadEvaluate(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "online-rules":
+			s.handleOnlineRules(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "online-rules":
+			s.handleOnlineRule(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "online-rules" && rest[2] == "run":
+			s.handleOnlineRuleRun(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "alerts":
+			s.handleAlerts(w, r, projectID)
+		case len(rest) == 3 && rest[0] == "alerts" && rest[2] == "ack":
+			s.handleAlertAck(w, r, projectID, rest[1])
 		case len(rest) == 1 && rest[0] == "datasets":
 			s.handleDatasets(w, r, projectID)
 		case len(rest) == 1 && rest[0] == "prompts":

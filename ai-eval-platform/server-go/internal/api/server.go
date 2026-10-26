@@ -17,6 +17,7 @@ import (
 
 	"evalforge/internal/config"
 	"evalforge/internal/model"
+	"evalforge/internal/online"
 	"evalforge/internal/queue"
 	"evalforge/internal/worker"
 )
@@ -38,6 +39,9 @@ type Server struct {
 
 	queue  *queue.Queue
 	worker *worker.Client
+	// online scores live traffic against user-defined rules. It runs off the
+	// ingest path, bounded, and owns no request state.
+	online *online.Engine
 
 	// baseURL is this process's own origin, used by OAuth discovery and the
 	// worker callback. Tests point it at httptest.Server.
@@ -76,8 +80,17 @@ func New(control, telemetry *sql.DB, cfg config.Config, log *slog.Logger) *Serve
 		InternalToken: s.internalToken,
 		Log:           log,
 	}
+	s.online = online.New(control, telemetry, &worker.Scorer{Client: s.worker, Timeout: cfg.OnlineTimeout},
+		log, cfg.OnlineConcurrency, cfg.OnlineTimeout)
 	return s
 }
+
+// SetOnlineScorer swaps the scoring backend. Tests use it to keep matching and
+// persistence deterministic without spawning Python.
+func (s *Server) SetOnlineScorer(sc online.Scorer) { s.online.SetScorer(sc) }
+
+// StopOnline cancels queued and in-flight online evaluations and waits.
+func (s *Server) StopOnline() { s.online.Stop() }
 
 // CreateAPIKey mints a credential outside the HTTP surface. It backs the
 // `--create-key` bootstrap path; the raw key is returned once and never stored.
