@@ -12,6 +12,10 @@
 # the Blueprint Path to `ai-eval-platform/render.yaml`. Then set the two
 # `sync: false` values (below) in the dashboard.
 #
+# Zero-cost demo: Render's Free compute plan does not require a card. Use
+# `render-free.yaml` instead of this file; it drops the disk and uses
+# ephemeral storage for DuckDB. See DEPLOY.md.
+#
 # This repository keeps EvalForge in `ai-eval-platform/`, so the Docker context
 # and both Dockerfile paths are relative to the repository root (Render resolves
 # them from the root, not from this file's directory).

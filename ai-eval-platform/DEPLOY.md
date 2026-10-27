@@ -255,6 +255,32 @@ console. Render builds both Dockerfiles from this repository, so there is nothin
    python worker-py/seed.py --base https://<api>.onrender.com
    ```
 
+### Zero-cost demo (no card)
+
+Render's **Free** compute plan does not require a payment method. Use
+`render-free.yaml` instead of `render.yaml` when you want a demo without a
+card:
+
+1. Render dashboard → **New → Blueprint** → `archief2910/EvalForger`.
+2. **Blueprint Path:** `ai-eval-platform/render-free.yaml`.
+3. Enter `OPENROUTER_API_KEY`; leave `PUBLIC_BASE_URL` blank for now.
+4. Apply, then set `PUBLIC_BASE_URL` to the `evalforge-free-web` URL and
+   redeploy the API.
+
+The Free plan is a demo tier, not production:
+
+- Services spin down after 15 idle minutes; the next request takes about a
+  minute to wake them.
+- There is no disk, so the DuckDB telemetry file lives in `/tmp` and is lost
+  on every restart, redeploy, or spin-down. Re-run
+  `python worker-py/seed.py --base https://<api>.onrender.com` after a cold
+  start.
+- The free Postgres database expires 30 days after creation.
+- The workspace gets 750 free instance hours per month, shared by both
+  services. Idle spin-down keeps a demo well under this.
+- No Shell access and no persistent disks. The custom-metric sandbox still
+  returns 503 because Render has no Docker daemon.
+
 ### What is different in the cloud
 
 | Thing | On Render |

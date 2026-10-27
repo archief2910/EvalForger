@@ -1,0 +1,85 @@
+# Zero-cost Render blueprint for EvalForge demos.
+#
+# Use this instead of render.yaml when you do not want to add a payment
+# method. Render's Free compute plan does not require a card.
+#
+# What is different from render.yaml:
+#   - both web services use the Free plan (0.1 CPU / 512 MB)
+#   - there is no persistent disk: DuckDB telemetry lives in /tmp and is
+#     lost whenever the service restarts, redeploys, or spins down after
+#     15 idle minutes. Re-run worker-py/seed.py after a cold start.
+#   - the free Postgres database expires 30 days after creation.
+#
+# Blueprint Path in the Render dashboard:
+#   ai-eval-platform/render-free.yaml
+#
+# Free-plan limits that matter for this app:
+#   - 750 free instance hours per workspace per month, shared by both
+#     services. They spin down when idle, so a demo usually stays well
+#     under this.
+#   - no Shell access and no persistent disks.
+#   - the custom-metric sandbox still does not work: Render has no Docker
+#     daemon, so running a custom metric returns 503.
+
+databases:
+  - name: evalforge-free-db
+    databaseName: evalforge
+    user: evalforge
+    plan: free
+    region: oregon
+
+services:
+  - type: web
+    name: evalforge-free-api
+    runtime: docker
+    dockerContext: ai-eval-platform
+    dockerfilePath: ai-eval-platform/deploy/Dockerfile.server
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: CONTROL_DB_URL
+        fromDatabase:
+          name: evalforge-free-db
+          property: connectionString
+      # No disk on the Free plan, so keep telemetry on the ephemeral
+      # filesystem. The app creates this directory at boot.
+      - key: DATA_DIR
+        value: /tmp/evalforge
+      - key: TELEMETRY_DB_PATH
+        value: /tmp/evalforge/telemetry.duckdb
+      # `off` lets anyone who reaches the URL read and write. Fine for a
+      # demo; switch to `required` and mint a key before sharing it.
+      - key: AUTH_MODE
+        value: "off"
+      # Set this to the web service URL after the first deploy.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # LLM judges and the optimizer. Without it, judges fall back to
+      # labelled deterministic heuristics and optimizer candidates tie.
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: LOG_LEVEL
+        value: info
+
+  - type: web
+    name: evalforge-free-web
+    runtime: docker
+    dockerContext: ai-eval-platform
+    dockerfilePath: ai-eval-platform/deploy/Dockerfile.web
+    plan: free
+    region: oregon
+    healthCheckPath: /
+    envVars:
+      # nginx substitutes these at container start. Render assigns PORT.
+      - key: API_SCHEME
+        value: https
+      - key: API_HOST
+        fromService:
+          type: web
+          name: evalforge-free-api
+          property: host
