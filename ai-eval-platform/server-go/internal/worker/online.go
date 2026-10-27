@@ -42,6 +42,37 @@ func (s *Scorer) ScoreTrace(ctx context.Context, req online.ScoreRequest) ([]onl
 		"--project-id", req.ProjectID,
 		"--scorers", strings.Join(req.Scorers, ","),
 	}
+	return s.runOnlineWorker(ctx, args, timeout)
+}
+
+// ScoreThread runs the configured thread scorers against one conversation.
+//
+// The shape is the same as ScoreTrace: one subprocess, one JSON document on
+// stdout, progress on stderr. A conversation is scored as a whole because
+// that is what thread scorers judge.
+func (s *Scorer) ScoreThread(ctx context.Context, req online.ThreadScoreRequest) ([]online.Score, error) {
+	if s.Client == nil {
+		return nil, fmt.Errorf("worker client is not configured")
+	}
+	timeout := s.Timeout
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	args := []string{
+		s.Client.ScriptPath,
+		"--online",
+		"--thread-id", req.ThreadID,
+		"--project-id", req.ProjectID,
+		"--scorers", strings.Join(req.Scorers, ","),
+	}
+	return s.runOnlineWorker(ctx, args, timeout)
+}
+
+// runOnlineWorker executes the worker in online mode and parses its result.
+func (s *Scorer) runOnlineWorker(ctx context.Context, args []string, timeout time.Duration) ([]online.Score, error) {
 	cmd := exec.CommandContext(ctx, s.Client.Python, args...)
 	cmd.Env = workerEnv(s.Client.BaseURL, s.Client.InternalToken)
 	var stdout, stderr bytes.Buffer

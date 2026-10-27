@@ -12,10 +12,11 @@ import (
 // fakeScorer stands in for the Python worker: online matching and persistence
 // are what these tests verify, not scorer correctness (worker tests cover that).
 type fakeScorer struct {
-	mu    sync.Mutex
-	score float64
-	calls []online.ScoreRequest
-	err   error
+	mu          sync.Mutex
+	score       float64
+	calls       []online.ScoreRequest
+	threadCalls []online.ThreadScoreRequest
+	err         error
 }
 
 func (f *fakeScorer) ScoreTrace(_ context.Context, req online.ScoreRequest) ([]online.Score, error) {
@@ -34,10 +35,32 @@ func (f *fakeScorer) ScoreTrace(_ context.Context, req online.ScoreRequest) ([]o
 	return out, nil
 }
 
+func (f *fakeScorer) ScoreThread(_ context.Context, req online.ThreadScoreRequest) ([]online.Score, error) {
+	f.mu.Lock()
+	f.threadCalls = append(f.threadCalls, req)
+	score, err := f.score, f.err
+	f.mu.Unlock()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]online.Score, 0, len(req.Scorers))
+	for _, name := range req.Scorers {
+		v := score
+		out = append(out, online.Score{Scorer: name, Score: &v, Rationale: "fake", JudgeMode: "fake"})
+	}
+	return out, nil
+}
+
 func (f *fakeScorer) callCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.calls)
+}
+
+func (f *fakeScorer) threadCallCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.threadCalls)
 }
 
 func newOnlineEnv(t *testing.T) (*testEnv, *fakeScorer, string) {

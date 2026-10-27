@@ -24,6 +24,8 @@ const (
 	// KindEval is a dataset experiment. KindThreadEval scores one conversation.
 	KindEval       = "eval"
 	KindThreadEval = "thread_eval"
+	// KindOptimize searches for a better prompt over a pinned dataset snapshot.
+	KindOptimize = "optimize"
 )
 
 // Job is one claimable unit of work.
@@ -86,6 +88,19 @@ func (q *Queue) EnqueueThreadEvalTx(ctx context.Context, tx *sql.Tx, projectID, 
 		attempts, max_attempts, created_at, updated_at)
 		VALUES (?,?,?,?,?,?,?,0,2,?,?)`,
 		id, KindThreadEval, "", projectID, threadID, string(payload), StatusQueued, ts, ts)
+	return id, err
+}
+
+// EnqueueOptimizeTx writes an optimization job. The job's experiment_id column
+// holds the optimization id: it is the row this work is about, and the queue
+// does not need a second routing column for it.
+func (q *Queue) EnqueueOptimizeTx(ctx context.Context, tx *sql.Tx, optimizationID, projectID string, payload []byte) (string, error) {
+	ts := model.NowUTC()
+	id := model.NewID()
+	_, err := tx.ExecContext(ctx, `INSERT INTO jobs(id, kind, experiment_id, project_id, payload, status,
+		attempts, max_attempts, created_at, updated_at)
+		VALUES (?,?,?,?,?,?,0,2,?,?)`,
+		id, KindOptimize, optimizationID, projectID, string(payload), StatusQueued, ts, ts)
 	return id, err
 }
 

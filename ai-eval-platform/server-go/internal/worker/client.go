@@ -135,6 +135,39 @@ type ThreadRequest struct {
 	ScorerNames []string
 }
 
+// run executes one worker subprocess with an explicit timeout and reports its
+// tail. All modes share this so shutdown, timeout and diagnostic handling stay
+// identical across them.
+func (c *Client) run(parent context.Context, args []string, label string, timeout time.Duration) Outcome {
+	if timeout <= 0 {
+		timeout = c.Timeout
+	}
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, c.Python, args...)
+	cmd.Env = workerEnv(c.BaseURL, c.InternalToken)
+	out, err := cmd.CombinedOutput()
+	tail := string(out)
+	if len(tail) > 4000 {
+		tail = tail[len(tail)-4000:]
+	}
+	switch {
+	case parent.Err() != nil:
+		return Outcome{Diagnostic: "released on shutdown", Released: true}
+	case ctx.Err() == context.DeadlineExceeded:
+		return Outcome{Diagnostic: fmt.Sprintf("worker timed out after %s", timeout), TimedOut: true}
+	case err != nil:
+		c.Log.Warn("worker failed", "label", label, "err", err, "output", tail)
+		if strings.TrimSpace(tail) == "" {
+			tail = err.Error()
+		}
+		return Outcome{Diagnostic: tail}
+	default:
+		c.Log.Info("worker finished", "label", label, "output", tail)
+		return Outcome{}
+	}
+}
+
 // workerEnv returns the process environment with GO_SERVER pointed at this
 // server, so a non-default ADDR (or a second instance) still reports back here.
 // The internal token is injected last so an inherited value cannot override it.

@@ -44,8 +44,14 @@ def _post(path, payload):
 
 # ---------------- provider ----------------
 
-# The router refuses any model id other than this literal, so it is not configurable.
-MODEL = "openrouter/free"
+# Which model the worker calls, and therefore which provider key it needs.
+#
+# `openrouter/free` is an OpenRouter alias that picks whatever free model it
+# feels like; it is a fine default for a demo but it is rate-limited and its
+# behaviour changes under you. Set OPENROUTER_MODEL to pin a real one, e.g.
+# `openai/gpt-4o-mini` or `anthropic/claude-3.5-haiku`. The value is passed to
+# the provider verbatim, so use a provider-qualified id.
+MODEL = os.environ.get("OPENROUTER_MODEL") or "openrouter/free"
 
 
 def provider_config():
@@ -525,6 +531,166 @@ def run_online(args):
     print(json.dumps({"scores": results}), flush=True)
 
 
+def run_online_thread(args):
+    """Score one live conversation for an online thread rule.
+
+    The conversation is read over the API and scored as a whole: thread
+    scorers judge the sequence of turns, not one turn in isolation. The
+    result is printed as one JSON document, like the trace path, so the
+    server owns persistence and this mode owns execution.
+    """
+    if not args.thread_id:
+        raise SystemExit("--thread-id is required with --online --thread-id")
+    detail = _get(f"/projects/{args.project_id}/threads/{args.thread_id}")
+    turns = detail.get("turns") or []
+    if not turns:
+        raise SystemExit(f"thread {args.thread_id} has no turns")
+    names = [s.strip() for s in (args.scorers or "").split(",") if s.strip()]
+    results = []
+    for name in names:
+        res = run_thread_scorer(name, turns)
+        if res:
+            results.append(res)
+    log(f"online thread={args.thread_id} turns={len(turns)} scorers={len(results)}")
+    print(json.dumps({"scores": results}), flush=True)
+
+
+# ---------------- optimization ----------------
+
+# Candidate prompt strategies. Each is a deterministic instruction added to the
+# baseline template. This is a search over prompt variants, not a learned
+# optimizer: the point is that the winner is measured on a pinned dataset with
+# pinned scorers, not that the search is clever.
+OPTIMIZER_STRATEGIES = [
+    ("concise", "Answer concisely and directly."),
+    ("step_by_step", "Think step by step, then give the final answer."),
+    ("grounded", "Answer only from the context given. If the context does not contain the answer, say so plainly."),
+    ("structured", "Give the direct answer first, then a brief explanation."),
+    ("no_hedge", "Do not hedge. If you are unsure, say what is missing instead of speculating."),
+]
+
+
+def _baseline_template(prompt):
+    """The baseline prompt body as a plain string, plus its message form."""
+    if prompt is None:
+        return None
+    template = prompt.get("template")
+    if isinstance(template, dict) and "messages" in template:
+        return template
+    if isinstance(template, str):
+        return template
+    if template is None:
+        return None
+    return json.dumps(template, ensure_ascii=False)
+
+
+def _with_instruction(template, instruction):
+    """Append an instruction to a prompt, keeping the message shape intact."""
+    if template is None:
+        return instruction
+    if isinstance(template, dict) and "messages" in template:
+        messages = [dict(m) for m in template["messages"]]
+        if messages:
+            last = messages[-1]
+            last["content"] = (str(last.get("content", "")) + "\n\n" + instruction).strip()
+        else:
+            messages.append({"role": "user", "content": instruction})
+        return {"messages": messages}
+    return (str(template).rstrip() + "\n\n" + instruction).strip()
+
+
+def _mean(values):
+    return round(sum(values) / len(values), 4) if values else None
+
+
+def _evaluate_candidate(records, template, scorer_names, kinds, salt):
+    """Run one candidate over the whole dataset and score it."""
+    per_scorer = {}
+    outputs = []
+
+    def run_record(i, rec):
+        sinput = rec.get("input")
+        expected = rec.get("expected")
+        out, err, mode = generate_task(sinput, "auto", salt=salt + str(i), prompt_template=template)
+        scores = {}
+        for name in scorer_names:
+            kind = kinds.get(name, "deterministic")
+            res = run_scorer(name, kind, {}, json.dumps(sinput if not isinstance(sinput, str) else sinput),
+                             out, expected)
+            if res and res.get("score") is not None:
+                scores[name] = res["score"]
+        return scores, out, err, mode
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max(1, min(4, len(records)))) as pool:
+        results = list(pool.map(lambda a: run_record(*a), list(enumerate(records))))
+
+    for scores, out, err, mode in results:
+        outputs.append({"output": out, "error": err, "mode": mode, "scores": scores})
+        for name, value in scores.items():
+            per_scorer.setdefault(name, []).append(value)
+
+    summary = {name: {"mean": _mean(values), "count": len(values)} for name, values in per_scorer.items()}
+    flat = [v for values in per_scorer.values() for v in values]
+    return {
+        "scores": {name: s["mean"] for name, s in summary.items()},
+        "summary": summary,
+        "mean": _mean(flat),
+        "runs": len(outputs),
+    }
+
+
+def run_optimize(args):
+    """Search for a better prompt over a pinned dataset snapshot.
+
+    The server owns the lifecycle and the promotion decision: this mode only
+    measures. It evaluates the baseline and every candidate on the same
+    snapshot with the same scorers, then reports the numbers.
+    """
+    if not args.dataset_version_id:
+        raise SystemExit("--dataset-version-id is required with --optimize")
+    ds = _get(f"/dataset_versions/{args.dataset_version_id}")
+    records = ds.get("records") or []
+    if not records:
+        raise SystemExit(f"dataset version {args.dataset_version_id} has no records")
+
+    scorer_names = [s.strip() for s in (args.scorers or "").split(",") if s.strip()] or ["exact_match"]
+    kinds = {b["name"]: b.get("kind", "deterministic") for b in _get("/scorers")}
+
+    baseline = None
+    if args.prompt_version_id:
+        baseline = _baseline_template(_get(f"/prompts/{args.prompt_version_id}"))
+    else:
+        baseline = {"messages": [
+            {"role": "user", "content": "Answer this support question accurately and concisely:\n{{input}}"}]}
+
+    results = []
+    baseline_result = _evaluate_candidate(records, baseline, scorer_names, kinds, "baseline:")
+    log(f"optimize baseline mean={baseline_result['mean']}")
+    results.append({"name": "baseline", "prompt": baseline, "scores": baseline_result["scores"],
+                    "mean": baseline_result["mean"], "summary": baseline_result["summary"]})
+
+    for name, instruction in OPTIMIZER_STRATEGIES[:max(0, args.max_candidates)]:
+        template = _with_instruction(baseline, instruction)
+        result = _evaluate_candidate(records, template, scorer_names, kinds, name + ":")
+        log(f"optimize candidate {name} mean={result['mean']}")
+        results.append({"name": name, "prompt": template, "scores": result["scores"],
+                        "mean": result["mean"], "summary": result["summary"]})
+
+    # The winner is the best mean, with the baseline breaking ties: a search
+    # that promotes a tie is not a search.
+    best = max(results, key=lambda r: (r["mean"] if r["mean"] is not None else -1,
+                                        1 if r["name"] == "baseline" else 0))
+    payload = {
+        "baseline": {"prompt": baseline, "scores": baseline_result["scores"],
+                     "mean": baseline_result["mean"], "summary": baseline_result["summary"]},
+        "candidates": results[1:],
+        "best": {"name": best["name"], "prompt": best["prompt"], "scores": best["scores"],
+                 "mean": best["mean"], "summary": best.get("summary", {})},
+    }
+    _post(f"/worker_callback/optimization/{args.optimization_id}", payload)
+    log(f"optimize done best={best['name']} mean={best['mean']}")
+
+
 # ---------------- main ----------------
 
 def main():
@@ -541,10 +707,19 @@ def main():
     ap.add_argument("--online", action="store_true")
     ap.add_argument("--trace-id", default="")
     ap.add_argument("--scorers", default="")
+    ap.add_argument("--optimize", action="store_true")
+    ap.add_argument("--optimization-id", default="")
+    ap.add_argument("--max-candidates", type=int, default=4)
     args = ap.parse_args()
 
+    if args.optimize:
+        run_optimize(args)
+        return
     if args.online:
-        run_online(args)
+        if args.thread_id:
+            run_online_thread(args)
+        else:
+            run_online(args)
         return
     if args.thread_id:
         run_thread_eval(args)
