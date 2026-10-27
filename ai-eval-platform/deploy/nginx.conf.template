@@ -14,6 +14,11 @@ server {
     listen ${PORT};
     server_name _;
 
+    # When API_HOST is a public Render hostname, nginx must present that name
+    # in TLS SNI and in the Host header. Sending the web service's own host
+    # would make Render route the proxied request back to this web service.
+    proxy_ssl_server_name on;
+
     # Ingest batches and long dashboard/compare queries both need room.
     client_max_body_size 32m;
 
@@ -29,7 +34,7 @@ server {
     location /v1/ {
         proxy_pass ${API_SCHEME}://${API_HOST};
         proxy_request_buffering off;
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
     }
@@ -37,12 +42,12 @@ server {
     location /otel/ {
         proxy_pass ${API_SCHEME}://${API_HOST};
         proxy_request_buffering off;
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
     }
 
     location /api/ {
         proxy_pass ${API_SCHEME}://${API_HOST};
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
         proxy_set_header X-Real-IP $remote_addr;
         proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
@@ -52,7 +57,7 @@ server {
     location /mcp {
         proxy_pass ${API_SCHEME}://${API_HOST};
         proxy_http_version 1.1;
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
         # The MCP Streamable HTTP transport keeps the response open.
         proxy_buffering off;
         proxy_read_timeout 3600s;
@@ -60,18 +65,19 @@ server {
 
     location /oauth/ {
         proxy_pass ${API_SCHEME}://${API_HOST};
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location /.well-known/ {
         proxy_pass ${API_SCHEME}://${API_HOST};
-        proxy_set_header Host $host;
+        proxy_set_header Host ${API_HOST};
         proxy_set_header X-Forwarded-Proto $scheme;
     }
 
     location /health {
         proxy_pass ${API_SCHEME}://${API_HOST};
+        proxy_set_header Host ${API_HOST};
         access_log off;
     }
 

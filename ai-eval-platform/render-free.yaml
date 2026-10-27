@@ -82,4 +82,6 @@ services:
         fromService:
           type: web
           name: evalforge-free-api
-          property: host
+          # `host` is the private-network name, which free services cannot
+          # receive. Use the public onrender.com hostname instead.
+          envVarKey: RENDER_EXTERNAL_HOSTNAME

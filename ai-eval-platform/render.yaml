@@ -96,4 +96,6 @@ services:
         fromService:
           type: web
           name: evalforge-api
-          property: host
+          # `host` is the private-network name. Use the public hostname so
+          # the same blueprint works for both private and public setups.
+          envVarKey: RENDER_EXTERNAL_HOSTNAME
