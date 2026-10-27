@@ -59,7 +59,7 @@ services:
       # `off` lets anyone who reaches the URL read and write. Switch to
       # `required` and mint a key before sharing it beyond a demo.
       - key: AUTH_MODE
-        value: off
+        value: "off"
       # Set this to the web service URL after the first deploy, e.g.
       # https://evalforge-web.onrender.com - it is published in OAuth discovery.
       - key: PUBLIC_BASE_URL
