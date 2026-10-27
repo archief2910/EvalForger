@@ -3,15 +3,8 @@
 An original, production-lean implementation of the LLM observability + evaluation loop:
 **instrument → observe traces → review → promote to dataset → run evaluations → compare vs baseline.**
 
-Three docs worth reading first:
-- **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** — how the system is actually wired (diagrams, component/tech
-  table, data model, faithfulness vs Braintrust, prioritised gap analysis).
-- **[docs/OPIK_ALIGNMENT.md](docs/OPIK_ALIGNMENT.md)** — a decision-by-decision comparison with the Opik source in
-  `opik/`: what we copy, what we adapt, what we reject, plus the corrected Go layout and the P0/P1/P2 roadmap.
-- **[docs/REVERSE_ENGINEERING.md](docs/REVERSE_ENGINEERING.md)** — the research behind it: observed facts about
-  Braintrust, our inferred architecture, data model, API design, MVP scope and monetization thesis.
 
-Open [docs/architecture.html](docs/architecture.html) in a browser for the rendered diagram.
+
 
 ## Stack
 - **API server**: Go (`server-go/`, module `evalforge`) — one binary, owns the PostgreSQL control plane and the
