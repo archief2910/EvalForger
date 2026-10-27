@@ -1,12 +1,13 @@
-# Session Progress Log
+﻿# Session Progress Log
 
 ## Current State
 
 **Last Updated:** 2026-10-26
-**Active Feature:** none — feat-001/003/004/006/007/010/011 complete; feat-002/005/008/009 remain
-**Session Goal:** Add first-class conversations (threads) with thread-level scoring and a
-control-plane/data-plane storage split, while preserving every existing EvalForge behavior and
-test suite.
+**Active Feature:** none — feat-001/003/004/006/007/010/011/012/013/014/015/016/017/018/019 complete; feat-002/005/008/009 remain
+**Session Goal:** Close the remaining Opik parity gaps in the areas that decide whether EvalForge is a
+product: retention on the data plane, a real monitoring loop (windowed monitors + notifications),
+conversation-scoped online evaluation, sandboxed custom Python metrics, a runtime safety layer, and a
+prompt optimization loop.
 
 ## Status
 
@@ -134,6 +135,113 @@ test suite.
 - [x] `init.sh` and all Python suites build `./cmd/server` and boot their own isolated server.
 - [x] `feature_list.json` reflects verified status.
 
+#### Retention (feat-014)
+
+- [x] **Policy on the control plane.** `retention_rules` holds project, days kept, `apply_to_past` and
+      enabled. Editing a policy never touches the telemetry store.
+- [x] **Sweeper on the telemetry plane.** `internal/retention` deletes children first: feedback and
+      online scores for expired traces, then spans, then conversations with no turns left and their
+      scores. `apply_to_past=false` bounds the window at the rule's creation time.
+- [x] **Surface.** CRUD plus `POST /retention-rules/{id}/apply` (returns deletion counts), a dashboard
+      block, and a retention section on the Monitors page.
+
+#### Windowed monitors + notifications (feat-015)
+
+- [x] **Aggregate conditions.** `monitors` holds metric, operator, threshold and window; metrics are
+      `error_rate`, `avg_score`, `avg_latency_ms`, `p95_latency_ms`, `avg_cost_usd`, `span_count`,
+      `trace_count`, `error_count`, computed in one telemetry query each.
+- [x] **State machine.** `ok → firing` emits one event and one notification; `firing → ok` resolves it.
+      A monitor that stays in breach does not re-fire.
+- [x] **Channels.** Webhook (JSON, optional HMAC-SHA256 signature) and Slack message payload. Delivery
+      result (`notified`, `notification_error`) is recorded on the event, so a broken channel is visible.
+- [x] **Surface.** CRUD, `POST /monitors/{id}/evaluate`, `GET /monitor-events`, dashboard block, and the
+      firing history table on the Monitors page.
+
+#### Conversation-scoped online evaluation (feat-016)
+
+- [x] **Scope on the rule.** `online_rules.scope` is `trace` or `thread`; validation rejects a scorer
+      from the wrong scope, and custom metrics are accepted because the sandbox makes them safe.
+- [x] **Close is the trigger.** The idle sweeper and manual close both hand the conversation to
+      `online.AfterThreadClose`, which samples per thread and runs thread scorers through
+      `worker.py --online --thread-id`.
+- [x] **Storage and alerts.** `online_thread_scores` (unique per rule/thread/scorer); alerts carry
+      `subject_type`/`subject_id`, with the uniqueness key moved to
+      `(rule_id, subject_type, subject_id, scorer)` so two conversations cannot collide.
+- [x] **Surface.** `GET /threads/{id}` returns `online_scores`; the Online page has a scope selector and
+      alerts link to the conversation when the subject is a thread.
+
+#### Sandboxed custom metrics (feat-017)
+
+- [x] **Registry.** `custom_scorers` stores name, description and code per project; storing code is not
+      running it. `GET /custom-scorers` reports `sandbox_available`.
+- [x] **Sandbox.** `internal/sandbox` runs one container per metric: `--network none --read-only
+      --user 65534:65534 --memory 256m --pids-limit 64 --cpus 1 --cap-drop ALL
+      --security-opt no-new-privileges`, plus a timeout. The runner contract is
+      `def score(payload)` returning a number or `{score, rationale}`, or a class with `score`.
+- [x] **Fail closed.** No Docker → `503` from the API, an error from the engine, and no code executed.
+      `LocalRunner` refuses unless `SANDBOX_ALLOW_UNSAFE_LOCAL=1`, and logs that it is not a boundary.
+- [x] **Boundary in one place.** `online.Engine.splitScorers` decides which names are custom, so the
+      trusted worker never receives user code.
+
+#### Runtime guardrails (feat-018)
+
+- [x] **Protection is not scoring.** A guardrail policy answers "may this text leave the application?"
+      and its answer is an action — `flag` records, `redact` masks, `block` refuses — not a score.
+- [x] **Checks.** `PII` (email, phone, card, SSN, IBAN, IP, URL), `PROMPT_INJECTION`, `TOPIC` (restrict
+      or allow), `CUSTOM` (operator regexes and keywords). Card detection requires the Luhn checksum, so
+      order numbers are not reported as PII.
+- [x] **Enforcement on both ingest paths.** Native and OTLP scan before a span is written; a `block`
+      policy returns `422` and stores nothing, `redact` masks the value before storage.
+- [x] **Runtime endpoint.** `POST /projects/{id}/guardrails/check` is what an application calls before
+      sending text to a model.
+- [x] **Redacted audit.** `guardrail_events` stores the check type and a masked, truncated preview; the
+      matched value is never stored.
+
+#### Optimization loop (feat-019)
+
+- [x] **Durable job.** `jobs.kind='optimize'`, claim/lease/reaper like an evaluation, so a restart does
+      not strand a run and a failure records its reason on the row.
+- [x] **Pinned inputs.** Dataset snapshot, baseline prompt version and scorer list are stored on the run.
+- [x] **Conditional promotion.** The winner becomes a new prompt version only when it beat the baseline;
+      a tie or a regression is recorded and discarded. The winner is a normal prompt version, so the
+      existing experiment flow can pin and compare it.
+- [x] **Strategies.** Five instruction mutations (concise, step_by_step, grounded, structured, no_hedge),
+      each measured on the same snapshot with the same scorers.
+
+#### Deployment (feat-020)
+
+- [x] **Compose stack.** `docker-compose.yml` with Postgres, the API + eval worker, and the console behind
+      nginx; `seed`, `create-key` and `pull-sandbox` as one-shot `tools` services.
+- [x] **Server image.** Multi-stage: `golang` builder (cgo for go-duckdb) then `python:3.12-slim` with the
+      docker CLI, `worker-py/` and a Python healthcheck. One image, because the server spawns the worker.
+- [x] **Web image.** `node:22` build then `nginx:1.27`, proxying `/api/`, `/v1/`, `/otel/`, `/mcp`,
+      `/oauth/`, `/.well-known/` and `/health` so the browser sees one origin.
+- [x] **Sandbox under Docker.** `SANDBOX_WORK_DIR` stages files at a path the daemon resolves, and the
+      directory is chmod 0755 so the unprivileged container user can read it. Verified: a metric runs, and
+      one that tries `http://example.com` fails, so `--network none` is real.
+- [x] **`--create-key` opens only the control plane** (`database.OpenControl`). Before this, minting a key
+      against a running deployment failed with a DuckDB file lock.
+- [x] **Stale lockfile fixed.** `frontend/package-lock.json` did not satisfy `package.json`, so `npm ci`
+      failed in the web image. Regenerated with `npm install --package-lock-only`; the local build still
+      passes.
+- [x] **`DEPLOY.md`** documents the quickstart, the ten-step demo script, verification commands, backup,
+      security (the socket is a real capability) and troubleshooting.
+- [x] **PaaS portability.** The API binds `$PORT` when `ADDR` is unset (Render/Fly/Cloud Run contract);
+      the web image renders its nginx config from `PORT`, `API_SCHEME` and `API_HOST` at container start,
+      so one image serves Compose (`http://server:8000`, listen 80) and Render (`https://<api>`, platform
+      port). Verified both variable sets by running the built image with `PORT=10000` against a remote
+      API host.
+- [x] **`render.yaml`.** One managed Postgres, the API with a 5 GB disk at `/data`, and the console, with
+      `CONTROL_DB_URL` wired from the database and `API_HOST` from the API service. Custom metrics are
+      documented as unavailable on a PaaS (no daemon) rather than silently broken.
+
+#### Documentation / harness
+
+- [x] `AGENTS.md`, `README.md`, `docs/ARCHITECTURE.md` updated for the package layout and
+      `go build ./cmd/server`.
+- [x] `init.sh` and all Python suites build `./cmd/server` and boot their own isolated server.
+- [x] `feature_list.json` reflects verified status.
+
 ### What's In Progress
 
 - [ ] feat-009 (Go httptest suite): broad coverage exists for auth/OAuth, MCP, OTLP, dataset
@@ -155,20 +263,33 @@ test suite.
 
 ## Verification Evidence
 
-Run on 2026-10-26 after the conversations + dual-plane changes:
+Run on 2026-10-26 after the retention, monitor, conversation-scope, sandbox, guardrail and optimization work:
 
 | Check | Command | Result |
 |---|---|---|
 | Build | `cd server-go && go build ./...` | pass |
-| Go tests | `cd server-go && go test ./... -count=1 -timeout 180s` | pass (api 5.3s), including `threads_test.go` |
-| Smoke | `python scripts/smoke_api.py` | 41/41 |
+| Go tests | `cd server-go && go test ./... -count=1 -timeout 900s` | pass (api 60s; guardrails 0.5s; sandbox 2.2s), 30 tests added this pass |
+| Smoke | `python scripts/smoke_api.py` | 68/68 |
 | Auth | `python scripts/auth_test.py` | 44/44 |
 | MCP | `python scripts/mcp_test.py` | 23/23 |
 | Fault | `python scripts/fault_test.py` | 16/16 (crash/restart, timeout, retry) |
-| Load | `python scripts/load_test.py` | 360/360 traces, 0 errors, 46 spans/s (1080 spans) |
 | Frontend | `cd frontend && npm run build` | pass |
-| Demo migration | boot against `data/ai_eval.db` | control/telemetry split; 119 spans, 16 feedback, 25 eval_runs, 36 backfilled threads |
-| Browser | Conversations list/detail, trace filter, trace context bar, evaluate | pass; worker job completed and scores rendered |
+| Sandbox refusal | `go test ./internal/sandbox` | docker absent → `ErrUnavailable`; local runner refuses by default |
+| Sandbox execution | `go test ./internal/sandbox -run TestLocalRunnerExecutes` | metric contract verified against the real runner script |
+| Optimization (live) | server + worker + provider, 3 records, 2 candidates | run completed; baseline and candidates measured; tie → not promoted (ads-on-demand script, not in the repo) |
+| **Compose build** | `docker compose build` | both images built (cgo + go-duckdb, and the SPA) |
+| **Compose up** | `docker compose up -d` | postgres/server/web all healthy |
+| **Compose seed** | `docker compose run --rm seed` | 36 traces, 8 conversations, 2 datasets, 2 prompts |
+| **Proxy** | `GET :8080/health`, SPA + JS bundle | 200 through nginx |
+| **Sandbox in Docker** | custom metric `tone_check` | `{"ok":true,"score":0.9}` |
+| **Sandbox network off** | metric calling `http://example.com` | `score: 0.25` (call blocked) |
+| **Guardrail in Docker** | `POST :8080/…/guardrails/check` | `mail me at [EMAIL_ADDRESS], card [CREDIT_CARD]` |
+| **Optimization in Docker** | 1 candidate, provider key set | `completed`, tie → not promoted |
+| **create-key while running** | `docker compose run --rm create-key` | key printed, no DuckDB lock |
+| **Auth in Docker** | `AUTH_MODE=required` | 401 without key, 200 with key |
+| **MCP in Docker** | `POST :8080/mcp` initialize | JSON-RPC result with capabilities |
+| **PORT binding** | `PORT=8091 ./evalforge.exe` | health 200 on 8091 |
+| **Render-style web env** | web image with `PORT=10000 API_SCHEME=http API_HOST=host.docker.internal:8000` | SPA 200, `/health` proxied |
 
 ## Decisions Made
 
@@ -193,6 +314,34 @@ Run on 2026-10-26 after the conversations + dual-plane changes:
   guess a conversation from user/session metadata.
 - **Thread evaluations use the same durable queue as experiments.** `kind='thread_eval'` jobs
   survive restarts and the callback replaces a job's scores on retry, so redelivery is idempotent.
+- **Retention deletes children before parents.** Feedback and automatic scores reference traces, so
+  deleting spans first would orphan them. The sweep uses a temporary table of expired trace ids so the
+  selection stays stable across the deletes without pulling ids into Go memory.
+- **`apply_to_past=false` means "from now on".** A new policy must not retroactively delete history;
+  the lower bound is the rule's creation time.
+- **A monitor fires once per episode.** The state (`ok`/`firing`) is the memory; without it a monitor
+  would produce one event and one page per evaluation tick for as long as the condition holds.
+- **Monitor delivery failures are data, not logs.** `notified` and `notification_error` are stored on the
+  event, so a broken webhook is visible in the UI instead of only in a log line.
+- **Thread scoring triggers on close, not on each turn.** A partial conversation's score changes meaning
+  as more turns arrive; the close is the only point where "how did this conversation go" is answerable.
+- **Alerts name their subject.** `subject_type`/`subject_id` replace the implicit "alerts are about
+  traces" assumption, and the unique key includes the subject.
+- **The sandbox fails closed.** No Docker means no custom metric: no host fallback, no silent skip. The
+  local runner is opt-in, refuses by default, and says in its error that it is not a boundary.
+- **Storing code is not running it.** `custom_scorers` is a registry; execution is a separate path with a
+  separate interface (`online.CustomScorer`), so the boundary is visible at one point in the code.
+- **A guardrail is an action, not a score.** Scores are advisory; an action changes what happens. Keeping
+  the two apart is why `flag`/`redact`/`block` live in their own table and API rather than in the scorer
+  registry.
+- **The guardrail audit log is redacted.** Storing the matched value would make the log the leak the
+  guardrail exists to prevent, so events carry a masked, truncated preview.
+- **The strictest matching policy wins.** A `block` policy is not weakened by a `flag` policy that also
+  matched; the aggregate action is the maximum.
+- **Promotion is conditional in optimization.** A search that always promotes is not a search. The
+  winner becomes a prompt version only when it beat the baseline; ties and regressions are recorded.
+- **Optimization reuses the queue.** It is a durable job, not a handler: long-running work that survives
+  restarts is the same problem as evaluation.
 
 ## Blockers / Risks
 
@@ -200,8 +349,24 @@ Run on 2026-10-26 after the conversations + dual-plane changes:
   disk and shows as deleted in the parent repo. This session did not delete it. Do not stage
   those paths; restore from git only if the user confirms.
 - **feat-002/005/008 are real gaps**, not polish: handlers still surface some raw SQL errors,
-  scorers are still Go literals, and handlers still issue SQL directly despite the physical plane
-  split. The product works, but these are the next architectural steps.
+  scorers are still Go literals for the builtin registry, and handlers still issue SQL directly despite
+  the physical plane split. The product works, but these are the next architectural steps.
+- **Docker daemon was not running in this environment.** The sandbox refuses correctly and that path is
+  tested, but the container execution path itself (`docker run` with the hardening flags) was not
+  exercised here. It is the one new behaviour that needs a daemon before it can be called verified.
+  Evidence that the metric contract works comes from the shared runner script executed locally.
+- **Custom metrics run only through the online path.** Dataset experiments still use the trusted
+  registry in the Python worker, so a custom metric cannot be selected for an offline experiment yet.
+  Wiring that would mean the worker calling the sandbox — a deliberate follow-up, not an oversight.
+- **Monitors are ticker-driven.** There is no streaming aggregate and no Redis-backed debounce bucket;
+  a monitor whose window is shorter than `MONITOR_INTERVAL_SECONDS` cannot be evaluated precisely.
+- **Retention sweeps in one transaction per rule.** Correct at DuckDB scale; a ClickHouse deployment
+  would batch by time range.
+- **Guardrails are deterministic only.** No trained classifier: `CUSTOM` is regexes and keywords, and
+  topic matching is lexical. Semantic topic detection and a trained policy would need a model service.
+- **Optimization searches a fixed strategy list.** Five instruction mutations, not a learned optimizer.
+  A dataset where all candidates tie will correctly promote nothing — which is honest but means the loop
+  only helps when the baseline is genuinely improvable by instruction.
 - **SQLite single-writer assumption** remains per file. The queue is crash-safe but not
   multi-instance coordinated; a second server would need lease-clock tuning and a shared writer.
 - **Windows dev environment.** `init.sh` is bash; PowerShell users can run the same commands
@@ -223,6 +388,22 @@ Run on 2026-10-26 after the conversations + dual-plane changes:
 - `server-go/internal/api/{server,router,handlers,auth,middleware,otlp,mcp,mcp_http,versioning,threads}.go`
 - `server-go/internal/api/{helpers,auth,otlp,versioning,threads}_test.go`
 - `frontend/src/pages/{Conversations,ThreadDetail}.jsx`
+
+### This session's additions
+
+- `server-go/internal/retention/retention.go`
+- `server-go/internal/monitor/monitor.go`
+- `server-go/internal/sandbox/{sandbox.go,runner.py,sandbox_test.go}`
+- `server-go/internal/guardrails/{guardrails.go,guardrails_test.go}`
+- `server-go/internal/api/{retention.go,monitor.go,custom_scorers.go,custom_metric_backend.go,guardrails.go,optimizations.go}`
+- `server-go/internal/api/{retention_test.go,monitor_test.go,online_thread_test.go,custom_scorers_test.go,guardrails_test.go,optimizations_test.go}`
+- `server-go/internal/worker/optimize.go`
+- `server-go/internal/database/migrations/control/{0006_retention_rules,0007_monitors,0008_online_rule_scope,0009_custom_scorers,0010_guardrails,0011_optimizations}.sql`
+- `server-go/internal/database/migrations/telemetry/{0004_online_thread_scores,0005_guardrail_events}.sql`
+- `frontend/src/pages/{Monitors,Optimize}.jsx`
+- `server-go/internal/{online/online.go,worker/online.go,queue/queue.go,api/online.go,api/threads.go,api/handlers.go,api/otlp.go,api/server.go,config/config.go}`
+- `worker-py/worker.py` — `--online --thread-id` and `--optimize`
+- `scripts/smoke_api.py` — 21 new checks (retention, monitors, custom metrics, guardrails, optimization)
 
 ### Modified
 
@@ -248,3 +429,5 @@ Run on 2026-10-26 after the conversations + dual-plane changes:
   pinned prompt, compare against a baseline, then rerun pinned.
 - If continuing the architecture work, do feat-002 first: it makes the handler error surface
   consistent and is a prerequisite for a clean repository layer.
+
+

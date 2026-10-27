@@ -8,7 +8,7 @@ import { api } from "../api.js";
 
 const EMPTY = {
   name: "", scorers: ["exact_match"], sample_rate: 1, alert_threshold: 0.5,
-  filter_status: "", filter_model: "", filter_name: "",
+  filter_status: "", filter_model: "", filter_name: "", scope: "trace",
 };
 
 function filterSummary(rule) {
@@ -25,6 +25,7 @@ export default function Online() {
   const [rules, setRules] = useState([]);
   const [alerts, setAlerts] = useState([]);
   const [scorers, setScorers] = useState([]);
+  const [threadScorers, setThreadScorers] = useState([]);
   const [form, setForm] = useState(EMPTY);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
@@ -35,8 +36,13 @@ export default function Online() {
   };
   useEffect(() => {
     load();
-    api.get(`/api/v1/scorers?scope=record`).then(setScorers).catch(() => setScorers([]));
+    // Custom metrics are project-scoped, so the registry request names the
+    // project; builtins come back either way.
+    api.get(`/api/v1/scorers?scope=record&project_id=${pid}`).then(setScorers).catch(() => setScorers([]));
+    api.get(`/api/v1/scorers?scope=thread`).then(setThreadScorers).catch(() => setThreadScorers([]));
   }, [pid]);
+
+  const availableScorers = form.scope === "thread" ? threadScorers : scorers;
 
   const toggleScorer = (name) => {
     setForm((f) => ({
@@ -101,6 +107,19 @@ export default function Online() {
             <div style={{ display: "grid", gap: 8 }}>
               <input placeholder="Rule name (e.g. hallucination watch)" value={form.name}
                 onChange={(e) => setForm({ ...form, name: e.target.value })} />
+              {/* Scope decides the trigger and the scorers: a trace rule scores
+                  one request on ingest, a conversation rule scores the whole
+                  conversation when it closes. */}
+              <div className="row">
+                <select value={form.scope} title="What this rule scores"
+                  onChange={(e) => setForm({ ...form, scope: e.target.value, scorers: [] })}>
+                  <option value="trace">one trace</option>
+                  <option value="thread">whole conversation</option>
+                </select>
+                <span style={{ color: "var(--muted)", fontSize: 12 }}>
+                  {form.scope === "thread" ? "scored when the conversation closes" : "scored on ingest"}
+                </span>
+              </div>
               <div className="row">
                 <input style={{ width: 110 }} type="number" step="0.05" min="0" max="1"
                   title="Fraction of matching traces to score"
@@ -117,23 +136,27 @@ export default function Online() {
               </div>
             </div>
             <div style={{ display: "grid", gap: 8 }}>
-              <div className="row">
-                <select value={form.filter_status} onChange={(e) => setForm({ ...form, filter_status: e.target.value })}>
-                  <option value="">Any status</option>
-                  <option value="ok">status = ok</option>
-                  <option value="error">status = error</option>
-                </select>
-                <input placeholder="model (exact)" value={form.filter_model}
-                  onChange={(e) => setForm({ ...form, filter_model: e.target.value })} />
-              </div>
-              <input placeholder="trace name contains…" value={form.filter_name}
-                onChange={(e) => setForm({ ...form, filter_name: e.target.value })} />
+              {form.scope === "trace" && (
+                <>
+                  <div className="row">
+                    <select value={form.filter_status} onChange={(e) => setForm({ ...form, filter_status: e.target.value })}>
+                      <option value="">Any status</option>
+                      <option value="ok">status = ok</option>
+                      <option value="error">status = error</option>
+                    </select>
+                    <input placeholder="model (exact)" value={form.filter_model}
+                      onChange={(e) => setForm({ ...form, filter_model: e.target.value })} />
+                  </div>
+                  <input placeholder="trace name contains…" value={form.filter_name}
+                    onChange={(e) => setForm({ ...form, filter_name: e.target.value })} />
+                </>
+              )}
               <div style={{ color: "var(--muted)", fontSize: 11 }}>SCORERS</div>
               <div className="row" style={{ flexWrap: "wrap", gap: 6 }}>
-                {scorers.map((s) => (
+                {availableScorers.map((s) => (
                   <label key={s.name} className="row" style={{ fontSize: 12, color: "var(--muted)", gap: 4 }}>
                     <input type="checkbox" checked={form.scorers.includes(s.name)} onChange={() => toggleScorer(s.name)} />
-                    {s.name}
+                    {s.name}{s.custom ? " (custom)" : ""}
                   </label>
                 ))}
               </div>
@@ -150,12 +173,13 @@ export default function Online() {
       <div className="panel" style={{ padding: 0 }}>
         <table>
           <thead>
-            <tr><th>Rule</th><th>Matches</th><th>Scorers</th><th>Sample</th><th>Alert below</th><th>State</th><th /></tr>
+            <tr><th>Rule</th><th>Scope</th><th>Matches</th><th>Scorers</th><th>Sample</th><th>Alert below</th><th>State</th><th /></tr>
           </thead>
           <tbody>
             {rules.map((r) => (
               <tr key={r.id}>
                 <td style={{ fontWeight: 600 }}>{r.name}</td>
+                <td><span className={"pill " + (r.scope === "thread" ? "" : "ok")}>{r.scope || "trace"}</span></td>
                 <td className="mono" style={{ color: "var(--muted)", fontSize: 11 }}>{filterSummary(r)}</td>
                 <td className="mono" style={{ fontSize: 11 }}>{(r.scorers || []).join(", ")}</td>
                 <td>{Math.round((r.sample_rate || 0) * 100)}%</td>
@@ -187,11 +211,19 @@ export default function Online() {
           <tbody>
             {alerts.map((a) => (
               <tr key={a.id}>
-                <td style={{ fontWeight: 600 }}>{a.rule_name || a.rule_id}</td>
+<td style={{ fontWeight: 600 }}>{a.rule_name || a.rule_id}</td>
                 <td>
-                  <Link className="mono" style={{ fontSize: 11 }} to={`/projects/${pid}/traces/${a.trace_id}`}>
-                    {String(a.trace_id).length > 24 ? String(a.trace_id).slice(0, 24) + "…" : a.trace_id}
-                  </Link>
+                  {/* An alert points at a trace or a conversation; both are
+                      addressable, so the link follows the subject type. */}
+                  {a.subject_type === "thread" ? (
+                    <Link className="mono" style={{ fontSize: 11 }} to={`/projects/${pid}/conversations/${a.subject_id}`}>
+                      {String(a.subject_id).length > 24 ? String(a.subject_id).slice(0, 24) + "." : a.subject_id}
+                    </Link>
+                  ) : (
+                    <Link className="mono" style={{ fontSize: 11 }} to={`/projects/${pid}/traces/${a.trace_id}`}>
+                      {String(a.trace_id).length > 24 ? String(a.trace_id).slice(0, 24) + "." : a.trace_id}
+                    </Link>
+                  )}
                 </td>
                 <td className="mono" style={{ fontSize: 11 }}>{a.scorer}</td>
                 <td className="neg">{a.score == null ? "–" : Number(a.score).toFixed(2)}</td>

@@ -1,4 +1,4 @@
-# EvalForge
+﻿# EvalForge
 
 An original, production-lean implementation of the LLM observability + evaluation loop:
 **instrument → observe traces → review → promote to dataset → run evaluations → compare vs baseline.**
@@ -60,23 +60,72 @@ and the import can be retried safely. Every historical trace is then backfilled 
 conversation.
 
 ## Run it
+
+### One command, with Docker
+
 ```bash
-# 0) PostgreSQL 16 with a database and role (local dev: the bundled data/pgdata cluster on :55432)
-#    CONTROL_DB_URL defaults to postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable
-export CONTROL_DB_URL='postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable'
-
-# 1) API server (from ai-eval-platform/server-go)
-cd ai-eval-platform/server-go
-go build -o evalforge.exe ./cmd/server && ./evalforge.exe     # → http://localhost:8000
-
-# 2) demo data (36 traces, including 8 multi-turn conversations, 2 datasets, 2 prompts)
-cd ai-eval-platform && python worker-py/seed.py
-
-# 3) frontend (new terminal)
-cd ai-eval-platform/frontend
-npm install      # already done if node_modules exists
-npm run dev      # → http://localhost:5173
+cp .env.example .env          # optional: add OPENROUTER_API_KEY
+docker compose up --build -d  # postgres + API/eval worker + web console
+docker compose run --rm seed  # demo data
+open http://localhost:8080
 ```
+
+That is the whole deployment: Postgres for metadata, DuckDB telemetry on a volume, the API with its
+Python worker, and the console behind nginx. Full instructions, the demo script, security notes and
+troubleshooting are in **[DEPLOY.md](DEPLOY.md)**. The same file has a Render section: `render.yaml`
+provisions a managed Postgres, the API with a telemetry disk, and the console.
+
+### From source, without Docker
+
+Telemetry is DuckDB, and its Go driver uses cgo, so the build needs a C compiler
+as well as Go 1.27+, Node 20+, Python 3.12+ and PostgreSQL 16:
+
+- **Windows:** `winget install --id BrechtSanders.WinLibs.POSIX.UCRT --exact`
+- **macOS:** `xcode-select --install`
+- **Debian/Ubuntu:** `sudo apt-get install build-essential`
+
+On Windows, one script starts the whole local stack:
+
+```powershell
+# from ai-eval-platform
+powershell -ExecutionPolicy Bypass -File .\scripts\start-local.ps1
+```
+
+It starts the project-local PostgreSQL cluster on `:55432`, builds the API with
+cgo, seeds the demo project, and starts Vite. Open **http://127.0.0.1:5173**.
+Stop it with `.\scripts\stop-local.ps1`; data stays in `data\`.
+
+The manual equivalent, if you prefer separate terminals:
+
+```powershell
+# 1) PostgreSQL 16 on :55432 (skip initdb if data\pgdata already exists)
+& "C:\Program Files\PostgreSQL\16\bin\initdb.exe" -D data\pgdata -U evalforge --auth=trust --encoding=UTF8 --no-locale
+Start-Process -FilePath "C:\Program Files\PostgreSQL\16\bin\pg_ctl.exe" `
+  -ArgumentList @('-D', "$PWD\data\pgdata", '-o', '"-p 55432 -h 127.0.0.1"', '-l', "$PWD\data\pg.log", 'start') `
+  -WindowStyle Hidden -Wait
+& "C:\Program Files\PostgreSQL\16\bin\createdb.exe" -h 127.0.0.1 -p 55432 -U evalforge evalforge
+& "C:\Program Files\PostgreSQL\16\bin\createdb.exe" -h 127.0.0.1 -p 55432 -U evalforge evalforge_test
+
+# 2) API server (cgo is required)
+$env:CGO_ENABLED = "1"      # and CC=<path to gcc> if gcc is not on PATH
+cd server-go
+go build -o evalforge.exe ./cmd/server
+$env:AUTH_MODE = "off"
+.\evalforge.exe                                  # → http://localhost:8000
+
+# 3) demo data (second terminal, from ai-eval-platform)
+python worker-py/seed.py
+
+# 4) console (third terminal, from ai-eval-platform)
+cd frontend
+npm install      # already done if node_modules exists
+npm run dev      # → http://127.0.0.1:5173
+```
+
+The default `CONTROL_DB_URL` is
+`postgres://evalforge@127.0.0.1:55432/evalforge?sslmode=disable`; point it at any
+PostgreSQL 16 instance to use a different control plane. Telemetry lives in
+`data/telemetry.duckdb` unless `TELEMETRY_DB_PATH` says otherwise.
 
 Optional real LLM provider (higher-quality judges/tasks; everything works offline without it).
 Put these in `ai-eval-platform/.env` (git-ignored, never committed):
@@ -84,9 +133,9 @@ Put these in `ai-eval-platform/.env` (git-ignored, never committed):
 OPENROUTER_API_KEY=sk-or-...
 OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
 ```
-The Go server loads `.env` on start and passes the environment to the worker. The model id is a
-fixed literal (`openrouter/free`) inside `worker-py/worker.py`, because the router rejects any other
-value — it is deliberately not configurable.
+The Go server loads `.env` on start and passes the environment to the worker. The model defaults to
+`openrouter/free`; set `OPENROUTER_MODEL` (e.g. `openai/gpt-4o-mini`) to pin a real one. Either way the
+provider must be an OpenRouter-compatible endpoint, because that is what the worker speaks.
 
 The free router picks reasoning models, which can spend the whole token budget before writing an
 answer. The worker handles that by escalating `max_tokens` and retrying, and records
@@ -276,13 +325,17 @@ Environment knobs for the server/worker split:
 | `TELEMETRY_DB_PATH` | `$DATA_DIR/telemetry.duckdb` | DuckDB file for traces, feedback, conversations, scores |
 | `LEGACY_DB` | – | extra SQLite file to import once, on top of the conventional names in `DATA_DIR` |
 | `THREAD_IDLE_SECONDS` | `1800` | idle conversations close after this many seconds; new activity reopens them |
-| `ADDR` | `:8000` | listen address |
+| `ADDR` | `:8000` (or `$PORT`) | listen address; on Render/Fly/Cloud Run the platform-assigned `PORT` is used when `ADDR` is unset |
 | `AUTH_MODE` | `off` | `required` enforces API keys / OAuth tokens on every non-public route |
 | `PUBLIC_BASE_URL` | listen address | public origin used in OAuth discovery and token audience (set it behind a proxy) |
 | `WORKER_PATH` | `../worker-py/worker.py` | worker script the server executes |
 | `WORKER_TIMEOUT_SECONDS` | `720` | hard cap per evaluation; a stalled worker is marked `failed` instead of running forever |
 | `ONLINE_CONCURRENCY` | `2` | traces scored at once by online rules; bounds provider load |
 | `ONLINE_TIMEOUT_SECONDS` | `180` | cap per online evaluation, so one slow judge cannot pin a slot |
+| `RETENTION_SWEEP_SECONDS` | `3600` | how often per-project retention policies are enforced |
+| `MONITOR_INTERVAL_SECONDS` | `60` | how often windowed monitors are evaluated |
+| `SANDBOX_IMAGE` | `python:3.12-slim` | interpreter image custom metrics run in |
+| `SANDBOX_ALLOW_UNSAFE_LOCAL` | – | `1` runs custom metrics in a local subprocess; **not an isolation boundary**, development only |
 | `LOG_LEVEL` | `info` | structured JSON logs (`debug`, `info`, `warn`, `error`) |
 | `GO_SERVER` | `http://localhost:8000` | where the worker calls back to |
 | `MCP_API_BASE` | `http://localhost:8000` | API the stdio MCP server talks to |
@@ -291,5 +344,16 @@ Environment knobs for the server/worker split:
 ## Product notes (why this loops)
 - Traces, datasets and experiments share one span-shaped data model, so production failures become regression tests without re-plumbing.
 - Conversations are first-class: a trace is one turn, `thread_id` groups turns, and thread-level scores are stored separately from per-trace scores so multi-turn quality is measurable on its own.
+- Online evaluation has two scopes: a `trace` rule scores one request on ingest, a `thread` rule scores the whole conversation when it closes. Both write scores without a human, and alerts name their subject (`trace` or `thread`).
+- Monitors watch aggregates, not requests: `error_rate > 5%` over a window fires once and resolves when it recovers, and can deliver to a webhook or Slack. Delivery success is recorded on the event, so a broken channel is visible.
+- Retention is a per-project policy, enforced by a sweeper on the telemetry plane; `apply_to_past=false` stops a new policy from deleting history.
+- Custom Python metrics are accepted only through a sandbox (Docker: no network, read-only, non-root, caps dropped, resource caps). With no sandbox reachable they fail closed — they never fall back to the host.
+- Guardrails are protection, not scoring: a policy runs on ingest and through `POST /guardrails/check`, and its action is `flag`, `redact` or `block`. The audit log stores a redacted preview, never the matched value.
+- Optimization closes the loop: a run measures a baseline and prompt candidates on a pinned dataset snapshot and promotes the winner only when it actually improved. A tie is recorded and discarded.
+- Guardrails are protection, not evaluation: a policy runs before telemetry is stored and can be called before text reaches a model. `flag` records, `redact` masks, `block` refuses — and the audit log keeps a masked preview, never the matched value.
+- Optimization closes the loop: a run measures a baseline prompt and a set of candidates on the same pinned dataset snapshot, then promotes the winner only if it actually scored higher. A tie or a regression is reported and discarded.
 - Honest scoring: every score carries its `judge_mode` (`llm` vs `heuristic_fallback`) and an unparseable judge answer is recorded as *absent*, never as a silent `0.0`. Conversation judges also fall back to deterministic heuristics when the provider is configured but broken.
 - Metering-friendly by design: spans carry byte/estimable payload; every recorded score is attributable (the two metrics Braintrust bills on).
+
+
+

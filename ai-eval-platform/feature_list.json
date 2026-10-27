@@ -3,7 +3,7 @@
     {
       "id": "feat-001",
       "name": "Idiomatic Go Restructure",
-      "description": "Refactor the monolithic server-go/main.go (1721 lines) into the idiomatic Go layout from OPIK_ALIGNMENT.md \u00a75: cmd/server/main.go, internal/{config,database,model,repository,service,api,worker}. Constructor injection, interfaces, no globals. This is the foundation for everything else.",
+      "description": "Refactor the monolithic server-go/main.go (1721 lines) into the idiomatic Go layout from OPIK_ALIGNMENT.md §5: cmd/server/main.go, internal/{config,database,model,repository,service,api,worker}. Constructor injection, interfaces, no globals. This is the foundation for everything else.",
       "dependencies": [],
       "status": "done",
       "evidence": "server-go/cmd/server/main.go + internal/{config,logging,database,model,queue,worker,api}. Handlers are Server methods; no package-level db/dbMu/logger. go build ./... and go test ./... green."
@@ -131,7 +131,82 @@
         "feat-011"
       ],
       "status": "done",
-      "evidence": "internal/online (matching, sampling, bounded engine, idempotent persistence), internal/api/online.go (rules CRUD, manual run, alerts/ack, dashboard block), worker --online mode, frontend Online page; Go tests for matching/sampling/scoring/alerts/ack/filters/PATCH; smoke 48/48 against the real worker."
+      "evidence": "internal/online (matching, sampling, bounded engine, idempotent persistence), internal/api/online.go (rules CRUD, manual run, alerts/ack, dashboard block), worker --online mode, frontend Online page; Go tests for matching/sampling/scoring/alerts/ack/filters/PATCH; smoke 61/61 against the real worker."
+    },
+    {
+      "id": "feat-014",
+      "name": "Retention Policies",
+      "description": "Per-project retention rules on the control plane, enforced by a telemetry sweeper. Expires spans, feedback, automatic scores and empty conversations; apply_to_past bounds the window at rule creation.",
+      "dependencies": [
+        "feat-012"
+      ],
+      "status": "done",
+      "evidence": "internal/retention + internal/api/retention.go + control/0006_retention_rules.sql; 5 Go tests (CRUD, validation, expiry, apply_to_past, dashboard) and smoke checks; children-first deletes proven by a trace that survives while an aged one is removed."
+    },
+    {
+      "id": "feat-015",
+      "name": "Windowed Monitors + Notification Channels",
+      "description": "Aggregate conditions over a time window (error rate, p95 latency, average score, cost, counts) with an ok/firing state machine: fires once per episode and resolves on recovery. Webhook and Slack delivery, with the delivery result recorded on the event.",
+      "dependencies": [
+        "feat-013"
+      ],
+      "status": "done",
+      "evidence": "internal/monitor + internal/api/monitor.go + control/0007_monitors.sql; 7 Go tests (CRUD, validation, fire-once, resolve, real webhook delivery, failed delivery recorded, dashboard stats); smoke checks."
+    },
+    {
+      "id": "feat-016",
+      "name": "Conversation-Scoped Online Evaluation",
+      "description": "Online rules gain a scope: trace rules score a request on ingest, thread rules score a conversation when it closes. Thread scores are stored separately and alerts carry subject_type/subject_id so they open the conversation.",
+      "dependencies": [
+        "feat-011",
+        "feat-013"
+      ],
+      "status": "done",
+      "evidence": "internal/online scope + splitScorers, worker.py --online --thread-id, control/0008_online_rule_scope.sql, telemetry/0004_online_thread_scores.sql; 6 Go tests (scope validation, close trigger, idempotency, manual run, trace/thread isolation, idle sweep); conversation detail returns online_scores."
+    },
+    {
+      "id": "feat-017",
+      "name": "Sandboxed Custom Python Metrics",
+      "description": "User-authored metrics stored on the control plane and executed only in a disposable Docker container (no network, read-only, non-root, caps dropped, memory/PID/CPU limits, timeout). Fails closed when no sandbox is reachable; a local subprocess runner refuses unless explicitly opted in.",
+      "dependencies": [
+        "feat-013"
+      ],
+      "status": "done",
+      "evidence": "internal/sandbox (DockerRunner + refusing LocalRunner + runner.py) + internal/api/custom_scorers.go + control/0009_custom_scorers.sql; 5 sandbox tests (refusal paths, real metric execution, error surfacing, score range) and 7 API tests (registry, validation, 409 duplicates, test endpoint, rule execution, fail-closed). Docker path not executed in this environment because no daemon is running."
+    },
+    {
+      "id": "feat-018",
+      "name": "Runtime Guardrails",
+      "description": "A protection layer distinct from scoring: project-scoped policies with PII, prompt-injection, topic and custom checks, an action of flag/redact/block, enforcement on native and OTLP ingest, a pre-flight check endpoint, and an audit log that stores a redacted preview.",
+      "dependencies": [
+        "feat-001",
+        "feat-011"
+      ],
+      "status": "done",
+      "evidence": "internal/guardrails (+9 engine tests), internal/api/guardrails.go (+6 API tests), control/0010_guardrails.sql, telemetry/0005_guardrail_events.sql; smoke checks for policy create, redaction on check, redaction before storage and a 422 block; dashboard block. Card detection is gated on the Luhn checksum."
+    },
+    {
+      "id": "feat-019",
+      "name": "Optimization Loop",
+      "description": "Evaluate, propose a better prompt, re-evaluate, keep the winner. A durable optimize job measures a baseline and candidate instruction mutations on a pinned dataset snapshot, then promotes the winner as a new prompt version only when it scored higher.",
+      "dependencies": [
+        "feat-006",
+        "feat-007",
+        "feat-010"
+      ],
+      "status": "done",
+      "evidence": "internal/api/optimizations.go (+6 API tests), queue.KindOptimize + worker.RunOptimize, worker.py --optimize (5 strategies), control/0011_optimizations.sql, Optimize page; live end-to-end run completed with a baseline and 2 candidates measured and no promotion on a tie; smoke checks for create/queue/list."
+    },
+    {
+      "id": "feat-020",
+      "name": "Docker Deployment",
+      "description": "A three-service Compose stack (Postgres, API + evaluation worker, nginx-served console) with one-shot tools for seeding, key minting and pre-pulling the sandbox image. The server image installs the docker CLI so custom metrics run in their own container.",
+      "dependencies": [
+        "feat-012",
+        "feat-017"
+      ],
+      "status": "done",
+      "evidence": "docker-compose.yml + deploy/{Dockerfile.server,Dockerfile.web,nginx.conf} + .dockerignore + .env.example + DEPLOY.md. Built and ran the stack: all services healthy, seed loaded 36 traces/8 conversations/2 datasets/2 prompts, sandbox metric returned 0.9 and a network probe returned 0.25 (network off), guardrail redaction through :8080, optimization completed, create-key works against a running server, AUTH_MODE=required returns 401/200, MCP initialize through the proxy. Fixed two real bugs found by deploying: --create-key opened DuckDB and hit a lock, and package-lock.json did not satisfy package.json so npm ci failed."
     }
   ]
 }

@@ -1,0 +1,30 @@
+# EvalForge web console. Build the SPA, serve it with nginx, and let nginx
+# forward the API paths to the server so the browser sees one origin.
+#
+# Build context is the repository root (see docker-compose.yml).
+# syntax=docker/dockerfile:1
+
+FROM node:22-alpine AS builder
+WORKDIR /web
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
+FROM nginx:1.27-alpine
+# Files ending in .template under /etc/nginx/templates are rendered by the
+# image's entrypoint, substituting the variables it finds in the environment.
+# That is what makes one image work in Compose and on Render, where the port
+# and the API origin are different.
+COPY deploy/nginx.conf.template /etc/nginx/templates/default.conf.template
+COPY --from=builder /web/dist /usr/share/nginx/html
+
+# Defaults for a plain `docker run`; Compose and Render override them.
+ENV PORT=80 \
+    API_SCHEME=http \
+    API_HOST=server:8000
+
+# Shell form, so ${PORT} is expanded at run time (exec form would not expand it).
+HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=5 \
+    CMD wget -q -O /dev/null "http://127.0.0.1:${PORT}/" || exit 1
+CMD ["nginx", "-g", "daemon off;"]

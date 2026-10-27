@@ -476,6 +476,114 @@ def run_checks():
           ack_status == 200 and ack.get("status") == "acknowledged" and not still_open,
           f"ack={ack} still_open={len(still_open)}")
 
+    # ---- retention policy ----
+    ret_status, ret_rule = call(
+        "POST", f"/api/v1/projects/{pid}/retention-rules",
+        {"name": "smoke 30 days", "retention_days": 30})
+    check("retention: policy created", ret_status == 200 and ret_rule.get("enabled"), ret_rule)
+    ret_list_status, ret_list = call("GET", f"/api/v1/projects/{pid}/retention-rules")
+    # The list endpoint returns an array, not an object.
+    check("retention: policy listed", ret_list_status == 200, ret_list)
+    if ret_rule.get("id"):
+        apply_status, applied = call(
+            "POST", f"/api/v1/projects/{pid}/retention-rules/{ret_rule['id']}/apply")
+        check("retention: apply runs and reports counts",
+              apply_status == 200 and "spans_deleted" in (applied.get("applied") or {}),
+              applied)
+    dash_ret_status, dash_ret = call("GET", f"/api/v1/projects/{pid}/dashboard")
+    check("retention: dashboard reports the policy",
+          (dash_ret.get("retention") or {}).get("enabled") is True,
+          dash_ret.get("retention"))
+
+    # ---- windowed monitors ----
+    mon_status, mon = call(
+        "POST", f"/api/v1/projects/{pid}/monitors",
+        {"name": "smoke error rate", "metric": "error_rate", "operator": ">",
+         "threshold": 0.5, "window_seconds": 3600})
+    check("monitor: created", mon_status == 200 and mon.get("state") == "ok", mon)
+    if mon.get("id"):
+        # The only trace in the project is healthy, so this evaluates without
+        # firing; the point is that the metric computes and the state is kept.
+        ev_status, ev = call(
+            "POST", f"/api/v1/projects/{pid}/monitors/{mon['id']}/evaluate")
+        check("monitor: evaluates a metric over a window",
+              ev_status == 200 and ev.get("value") is not None, ev)
+        bad_status, _ = call(
+            "POST", f"/api/v1/projects/{pid}/monitors",
+            {"name": "bad", "metric": "nope", "operator": ">", "threshold": 1})
+        check("monitor: unknown metric is rejected", bad_status == 400, bad_status)
+    evs_status, evs = call("GET", f"/api/v1/projects/{pid}/monitor-events")
+    check("monitor: events endpoint answers", evs_status == 200, evs)
+
+    # ---- custom metrics: registration only; execution needs the sandbox ----
+    metric_code = "def score(payload):\n    return 0.5\n"
+    cs_status, cs = call(
+        "POST", f"/api/v1/projects/{pid}/custom-scorers",
+        {"name": "smoke_metric", "description": "smoke", "code": metric_code})
+    check("custom metric: registered", cs_status == 200 and cs.get("kind") == "python_metric", cs)
+    cs_list_status, cs_list = call("GET", f"/api/v1/projects/{pid}/custom-scorers")
+    check("custom metric: registry reports sandbox availability",
+          cs_list_status == 200 and "sandbox_available" in cs_list, cs_list)
+    if not cs_list.get("sandbox_available"):
+        # Fail closed is the contract: without a sandbox the metric does not run.
+        test_status, test_out = call(
+            "POST", f"/api/v1/projects/{pid}/custom-scorers/smoke_metric/test")
+        check("custom metric: refuses to run without a sandbox", test_status == 503, test_out)
+    # A rule may name the custom metric; validation resolves it per project.
+    rule_status, cs_rule = call(
+        "POST", f"/api/v1/projects/{pid}/online-rules",
+        {"name": "smoke custom", "scorers": ["smoke_metric"], "sample_rate": 0})
+    check("custom metric: rules can name it", rule_status == 200, cs_rule)
+    bad_rule_status, _ = call(
+        "POST", f"/api/v1/projects/{pid}/online-rules",
+        {"name": "smoke bogus", "scorers": ["not_a_metric"]})
+    check("custom metric: unknown names are still rejected", bad_rule_status == 400, bad_rule_status)
+
+    # ---- runtime guardrails ----
+    gr_status, gr = call(
+        "POST", f"/api/v1/projects/{pid}/guardrail-policies",
+        {"name": "smoke pii", "mode": "redact",
+         "checks": [{"type": "PII"}]})
+    check("guardrail: policy created", gr_status == 200 and gr.get("mode") == "redact", gr)
+    check_status, check_out = call(
+        "POST", f"/api/v1/projects/{pid}/guardrails/check",
+        {"text": "email me at smoke@example.com"})
+    check("guardrail: check masks PII",
+          check_status == 200 and check_out.get("action") == "redact"
+          and "smoke@example.com" not in str(check_out.get("redacted")),
+          check_out)
+    ev_status, ev_out = call("GET", f"/api/v1/projects/{pid}/guardrail-events")
+    check("guardrail: decision is recorded", ev_status == 200, ev_out)
+    ingest_red, ingest_red_out = call(
+        "POST", f"/api/v1/projects/{pid}/spans:ingest",
+        {"events": [{"id": "guardrail-trace", "name": "agent", "type": "task",
+                     "input": "my email is smoke2@example.com", "output": "noted"}]})
+    check("guardrail: ingest redacts before storing", ingest_red == 200, ingest_red_out)
+    if ingest_red == 200:
+        tr_status, tr_out = call("GET", f"/api/v1/projects/{pid}/traces/guardrail-trace")
+        check("guardrail: stored trace carries the mask",
+              tr_status == 200 and "smoke2@example.com" not in str(tr_out), tr_status)
+    call("POST", f"/api/v1/projects/{pid}/guardrail-policies",
+         {"name": "smoke block", "mode": "block", "checks": [{"type": "PII"}]})
+    block_status, block_out = call(
+        "POST", f"/api/v1/projects/{pid}/spans:ingest",
+        {"events": [{"id": "blocked-trace", "name": "agent", "type": "task",
+                     "input": "card 4111 1111 1111 1111", "output": "ok"}]})
+    check("guardrail: block refuses the batch", block_status == 422, block_out)
+
+    # ---- optimization loop (created and queued; the worker runs async) ----
+    # `dsid` is the dataset promoted earlier in this run.
+    opt_status, opt = call(
+        "POST", f"/api/v1/projects/{pid}/optimizations",
+        {"name": "smoke optimize", "dataset_id": dsid,
+         "scorers": ["exact_match"], "max_candidates": 1})
+    check("optimization: run queued with a pinned snapshot",
+          opt_status == 200 and opt.get("status") == "queued"
+          and bool(opt.get("dataset_version_id")),
+          opt)
+    opt_list_status, opt_list = call("GET", f"/api/v1/projects/{pid}/optimizations")
+    check("optimization: listed", opt_list_status == 200, opt_list_status)
+
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     for name, _, detail in failed:

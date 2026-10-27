@@ -86,6 +86,34 @@ func OpenStores(ctx context.Context, cfg config.Config, log *slog.Logger) (*Stor
 	return &Stores{Control: control, Telemetry: telemetry}, nil
 }
 
+// OpenControl connects only to the control plane and applies its migrations.
+//
+// It exists for operations that are pure control-plane writes — minting a key,
+// which must work while a server is already running. DuckDB allows one writer
+// process per file, so a tool that opened the telemetry plane would fail
+// against a live deployment for no reason: it never reads telemetry.
+func OpenControl(ctx context.Context, cfg config.Config, log *slog.Logger) (*sql.DB, error) {
+	if err := ensureSchema(ctx, cfg); err != nil {
+		return nil, err
+	}
+	control := pgbind.Open(controlDSN(cfg))
+	control.SetMaxOpenConns(4)
+	control.SetMaxIdleConns(4)
+	if err := ping(ctx, control, "control", cfg.ControlURL); err != nil {
+		_ = control.Close()
+		return nil, err
+	}
+	if err := MigrateControl(ctx, control, log); err != nil {
+		_ = control.Close()
+		return nil, err
+	}
+	if err := SeedPrices(ctx, control); err != nil {
+		_ = control.Close()
+		return nil, fmt.Errorf("seed model prices: %w", err)
+	}
+	return control, nil
+}
+
 // controlDSN pins the schema for this process. Tests and harnesses give every
 // run its own schema, so they cannot see each other's rows.
 func controlDSN(cfg config.Config) string {

@@ -121,6 +121,38 @@ func (s *Server) handleIngest(w http.ResponseWriter, r *http.Request, projectID 
 	}
 
 	// --- pass 2: insert ---
+	// Runtime guardrails run before anything is written. A `block` policy
+	// refuses the whole batch, so a value the operator forbade never becomes a
+	// stored row; `redact` rewrites the text and `flag` records the finding and
+	// stores the text as it arrived.
+	if policies, err := s.enabledGuardrails(projectID); err == nil && len(policies) > 0 {
+		blocked := guardrailDecision{}
+		for pi := range preps {
+			inDec := s.applyGuardrails(projectID, preps[pi].trace, preps[pi].id, asGuardrailText(preps[pi].ev.Input), policies)
+			outDec := s.applyGuardrails(projectID, preps[pi].trace, preps[pi].id, asGuardrailText(preps[pi].ev.Output), policies)
+			if inDec.Action == "redact" && preps[pi].ev.Input != nil {
+				preps[pi].ev.Input = inDec.Redacted
+			}
+			if outDec.Action == "redact" && preps[pi].ev.Output != nil {
+				preps[pi].ev.Output = outDec.Redacted
+			}
+			if inDec.Action == "block" && blocked.Action != "block" {
+				blocked = inDec
+			}
+			if outDec.Action == "block" && blocked.Action != "block" {
+				blocked = outDec
+			}
+		}
+		if blocked.Action == "block" {
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]interface{}{
+				"error":    "guardrail blocked this batch",
+				"policy":   blocked.Policy,
+				"findings": blocked.Findings,
+				"inserted": 0,
+			})
+			return
+		}
+	}
 	now := time.Now().UTC().Format(time.RFC3339Nano)
 	threads := map[string]bool{}
 	for _, pr := range preps {
@@ -741,6 +773,10 @@ func (s *Server) handleDashboard(w http.ResponseWriter, r *http.Request, project
 		"threads":         threadStats,
 		"thread_scores":   threadScores,
 		"online":          s.onlineStats(r.Context(), projectID, time.Now().Add(-time.Duration(hours)*time.Hour)),
+		"retention":       s.retentionSummary(r, projectID),
+		"monitors":        s.monitors.ProjectStats(r.Context(), projectID),
+		"guardrails":      s.guardrailSummary(projectID),
+		"optimizations":   s.optimizationStats(projectID),
 	})
 }
 
@@ -1118,6 +1154,20 @@ func (s *Server) handleScorers(w http.ResponseWriter, r *http.Request, _ ...stri
 	for _, sc := range builtinScorers {
 		if scope == "" || sc["scope"] == scope {
 			out = append(out, sc)
+		}
+	}
+	// Custom metrics are project-scoped, so they only appear when the caller
+	// names a project. They are marked with their kind and the sandbox they
+	// run in, so a reader can tell a trusted scorer from user code.
+	if projectID := r.URL.Query().Get("project_id"); projectID != "" && allowProject(r, projectID) {
+		if rows, err := s.listCustomScorers(r.Context(), projectID); err == nil {
+			for _, row := range rows {
+				out = append(out, map[string]interface{}{
+					"name": row.Name, "kind": "python_metric", "scope": "record",
+					"description": row.Description, "custom": true,
+					"sandbox": s.sandbox.Describe(),
+				})
+			}
 		}
 	}
 	writeJSON(w, 200, out)

@@ -8,6 +8,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -16,9 +17,13 @@ import (
 	"time"
 
 	"evalforge/internal/config"
+	"evalforge/internal/guardrails"
 	"evalforge/internal/model"
+	"evalforge/internal/monitor"
 	"evalforge/internal/online"
 	"evalforge/internal/queue"
+	"evalforge/internal/retention"
+	"evalforge/internal/sandbox"
 	"evalforge/internal/worker"
 )
 
@@ -42,6 +47,17 @@ type Server struct {
 	// online scores live traffic against user-defined rules. It runs off the
 	// ingest path, bounded, and owns no request state.
 	online *online.Engine
+	// retention owns per-project telemetry policies and the sweeper that
+	// enforces them.
+	retention *retention.Store
+	// monitors evaluate aggregate conditions over a window of traffic and
+	// notify a channel when one starts firing.
+	monitors *monitor.Store
+	// sandbox executes user-authored metrics; it is the only path from stored
+	// code to execution.
+	sandbox sandbox.Runner
+	// guardrails enforce runtime safety policies on ingest and on request.
+	guardrails *guardrails.Store
 
 	// baseURL is this process's own origin, used by OAuth discovery and the
 	// worker callback. Tests point it at httptest.Server.
@@ -56,6 +72,10 @@ type Server struct {
 	// when AUTH_MODE=required. It is generated at boot, passed only to the
 	// child process and never logged or persisted.
 	internalToken string
+
+	// now is the clock. Tests replace it so a monitor window can be evaluated
+	// against a fixed point in time.
+	now func() time.Time
 }
 
 // New constructs the API surface. Start() is called separately so tests can
@@ -71,6 +91,7 @@ func New(control, telemetry *sql.DB, cfg config.Config, log *slog.Logger) *Serve
 		mcpAPIKey:     cfg.MCPAPIKey,
 		mcpHTTP:       &http.Client{Timeout: 60 * time.Second},
 		internalToken: randToken(32),
+		now:           time.Now,
 	}
 	s.worker = &worker.Client{
 		ScriptPath:    cfg.WorkerPath,
@@ -82,7 +103,50 @@ func New(control, telemetry *sql.DB, cfg config.Config, log *slog.Logger) *Serve
 	}
 	s.online = online.New(control, telemetry, &worker.Scorer{Client: s.worker, Timeout: cfg.OnlineTimeout},
 		log, cfg.OnlineConcurrency, cfg.OnlineTimeout)
+	s.retention = retention.New(control, telemetry, log)
+	s.monitors = monitor.New(control, telemetry, log)
+	s.monitors.SetNotifier(&monitor.WebhookNotifier{})
+	s.guardrails = guardrails.New(control, telemetry)
+	s.sandbox = selectSandbox(cfg, log)
+	s.online.SetCustomScorer(&customMetricBackend{s: s, run: s.sandbox, time: cfg.OnlineTimeout})
+	sandboxDescriber = s.sandbox.Describe
 	return s
+}
+
+// selectSandbox picks the isolation backend. Docker is the only one that
+// counts as isolation; the local subprocess is opt-in and refuses untrusted
+// code unless the operator has explicitly accepted the risk.
+func selectSandbox(cfg config.Config, log *slog.Logger) sandbox.Runner {
+	if cfg.SandboxUnsafeLocal {
+		log.Warn("custom metrics run in a local subprocess: this is NOT an isolation boundary and must not be used in production")
+		return &sandbox.LocalRunner{AllowUnsafe: true, Python: cfg.PythonBin, Timeout: cfg.OnlineTimeout}
+	}
+	docker := sandbox.NewDockerRunner()
+	if cfg.SandboxImage != "" {
+		docker.Image = cfg.SandboxImage
+	}
+	if !docker.Available() {
+		// Not an error: a deployment that does not use custom metrics does not
+		// need Docker. The API reports the sandbox as unavailable, and any
+		// attempt to run a custom metric fails closed.
+		log.Info("custom metric sandbox unavailable (docker not reachable); custom metrics will not run")
+	}
+	return docker
+}
+
+// NewControlOnly builds a Server with just the control plane.
+//
+// It is for maintenance commands (minting a key) that must run alongside a live
+// server: DuckDB permits one writer process per file, so opening telemetry here
+// would fail for a command that never reads it.
+func NewControlOnly(control *sql.DB, cfg config.Config, log *slog.Logger) *Server {
+	return &Server{
+		DB:      control,
+		cfg:     cfg,
+		log:     log,
+		baseURL: cfg.Issuer(),
+		now:     time.Now,
+	}
 }
 
 // SetOnlineScorer swaps the scoring backend. Tests use it to keep matching and
@@ -176,13 +240,109 @@ func (s *Server) startBackground(ctx context.Context) *sync.WaitGroup {
 			s.sweepThreads(ctx)
 		}()
 	}
+	// Retention: expire telemetry older than each project's policy. The
+	// interval is configurable because a demo wants to see it happen quickly
+	// and a deployment does not want a sweep every minute.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.sweepRetention(ctx)
+	}()
+	// Monitors: evaluate aggregate conditions over a window of traffic.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		s.evaluateMonitors(ctx)
+	}()
 	return &wg
+}
+
+// evaluateMonitors checks every monitor on a schedule.
+func (s *Server) evaluateMonitors(ctx context.Context) {
+	interval := s.cfg.MonitorInterval
+	if interval <= 0 {
+		interval = time.Minute
+	}
+	// Evaluate once at boot so a monitor that is already in breach is
+	// reported without waiting a full interval.
+	s.runMonitorEvaluation(ctx)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.runMonitorEvaluation(ctx)
+		}
+	}
+}
+
+// runMonitorEvaluation evaluates all monitors and logs the state changes.
+func (s *Server) runMonitorEvaluation(ctx context.Context) {
+	if s.monitors == nil {
+		return
+	}
+	results, err := s.monitors.EvaluateAll(ctx, s.now())
+	if err != nil {
+		s.log.Warn("monitor evaluation failed", "err", err)
+		return
+	}
+	for _, ev := range results {
+		if ev.Changed {
+			s.logf("monitor state changed",
+				"monitor_id", ev.Monitor.ID, "metric", ev.Monitor.Metric,
+				"value", ev.Value, "operator", ev.Monitor.Operator,
+				"threshold", ev.Monitor.Threshold, "firing", ev.Firing)
+		}
+	}
+}
+
+// sweepRetention enforces retention policies on a schedule.
+func (s *Server) sweepRetention(ctx context.Context) {
+	interval := s.cfg.RetentionSweep
+	if interval <= 0 {
+		interval = time.Hour
+	}
+	// Catch up on data that aged past its policy while the process was down.
+	s.applyRetention(ctx)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.applyRetention(ctx)
+		}
+	}
+}
+
+// applyRetention runs one sweep and logs what it removed.
+func (s *Server) applyRetention(ctx context.Context) {
+	if s.retention == nil {
+		return
+	}
+	results, err := s.retention.Sweep(ctx)
+	if err != nil {
+		s.log.Warn("retention sweep failed", "err", err)
+		return
+	}
+	for _, r := range results {
+		s.logf("retention applied",
+			"project_id", r.ProjectID, "retention_days", r.RetentionDays,
+			"spans", r.SpansDeleted, "feedback", r.FeedbackGone,
+			"scores", r.ScoresGone, "threads", r.ThreadsDeleted)
+	}
 }
 
 // RunJob is the queue handler: decode the job payload and run one worker.
 func (s *Server) RunJob(ctx context.Context, j queue.Job) queue.Outcome {
 	if j.Kind == queue.KindThreadEval {
 		return s.runThreadJob(ctx, j)
+	}
+	if j.Kind == queue.KindOptimize {
+		return s.runOptimizeJob(ctx, j)
 	}
 	var in model.EvalInput
 	if err := json.Unmarshal([]byte(j.Payload), &in); err != nil {
@@ -271,11 +431,18 @@ func errJSON(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// nilIfEmpty returns nil for an empty string, so an absent value and an empty
+// one serialise the same way.
 func nilIfEmpty(s string) interface{} {
 	if s == "" {
 		return nil
 	}
 	return s
+}
+
+// readAll reads a bounded request body.
+func readAll(r *http.Request) ([]byte, error) {
+	return io.ReadAll(io.LimitReader(r.Body, 1<<20))
 }
 
 func jsonOrNull(v interface{}) interface{} {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+﻿import { useEffect, useState } from "react";
 import { NavLink, Link, useParams, useLocation } from "react-router-dom";
 import { api } from "../api.js";
 
@@ -32,10 +32,12 @@ export function Sidebar() {
           <NavLink className="nav-item" to={`/projects/${pid}/traces`}>Logs &amp; Traces</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/conversations`}>Conversations</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/online`}>Online evaluation</NavLink>
+          <NavLink className="nav-item" to={`/projects/${pid}/monitors`}>Monitors &amp; policies</NavLink>
           <div className="nav-group">Evaluate</div>
           <NavLink className="nav-item" to={`/projects/${pid}/datasets`}>Datasets</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/experiments`}>Experiments</NavLink>
           <NavLink className="nav-item" to={`/projects/${pid}/prompts`}>Prompts</NavLink>
+          <NavLink className="nav-item" to={`/projects/${pid}/optimize`}>Optimize</NavLink>
           <div className="nav-group">Workflow</div>
           <div style={{ color: "var(--muted)", fontSize: 11.5, padding: "4px 10px", lineHeight: 1.6 }}>
             1. Inspect traces<br />
@@ -48,3 +50,4 @@ export function Sidebar() {
     </aside>
   );
 }
+

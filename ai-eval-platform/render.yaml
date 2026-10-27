@@ -1,0 +1,95 @@
+# Render blueprint for EvalForge.
+#
+# Two web services and one managed Postgres:
+#
+#   evalforge-api  the Go API + Python evaluation worker, with a persistent
+#                  disk for the DuckDB telemetry file
+#   evalforge-web  the React console, nginx-proxying /api, /v1, /mcp, /oauth
+#   evalforge-db   Render Postgres (control plane: projects, datasets, prompts,
+#                  rules, policies, jobs, credentials)
+#
+# Deploy: Render dashboard -> New -> Blueprint -> pick this repository and set
+# the Blueprint Path to `ai-eval-platform/render.yaml`. Then set the two
+# `sync: false` values (below) in the dashboard.
+#
+# This repository keeps EvalForge in `ai-eval-platform/`, so the Docker context
+# and both Dockerfile paths are relative to the repository root (Render resolves
+# them from the root, not from this file's directory).
+#
+# Plans: the API needs a disk, and disks require a paid instance type, so both
+# services use `0.5c-512mb` (Render's Starter plan). The free Postgres plan
+# expires after 30 days; move it to a paid plan before you rely on it.
+#
+# The custom-metric sandbox does NOT work on Render: there is no Docker daemon
+# to run a container in, so `GET /custom-scorers` reports
+# `sandbox_available: false` and running a metric returns 503. Everything else
+# (ingest, conversations, datasets, experiments, online rules, monitors,
+# retention, guardrails, optimization) is unaffected.
+
+databases:
+  - name: evalforge-db
+    databaseName: evalforge
+    user: evalforge
+    plan: free
+    region: oregon
+
+services:
+  - type: web
+    name: evalforge-api
+    runtime: docker
+    dockerContext: ai-eval-platform
+    dockerfilePath: ai-eval-platform/deploy/Dockerfile.server
+    plan: 0.5c-512mb
+    region: oregon
+    healthCheckPath: /health
+    # DuckDB telemetry lives on the disk; the control plane is Postgres.
+    disk:
+      name: evalforge-telemetry
+      mountPath: /data
+      sizeGB: 5
+    envVars:
+      - key: CONTROL_DB_URL
+        fromDatabase:
+          name: evalforge-db
+          property: connectionString
+      - key: DATA_DIR
+        value: /data
+      - key: TELEMETRY_DB_PATH
+        value: /data/telemetry.duckdb
+      # `off` lets anyone who reaches the URL read and write. Switch to
+      # `required` and mint a key before sharing it beyond a demo.
+      - key: AUTH_MODE
+        value: off
+      # Set this to the web service URL after the first deploy, e.g.
+      # https://evalforge-web.onrender.com - it is published in OAuth discovery.
+      - key: PUBLIC_BASE_URL
+        sync: false
+      # LLM judges and the optimizer. Without it, judges fall back to labelled
+      # deterministic heuristics and optimizer candidates tie.
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openrouter/free
+      - key: OPENROUTER_BASE_URL
+        value: https://openrouter.ai/api/v1
+      - key: LOG_LEVEL
+        value: info
+
+  - type: web
+    name: evalforge-web
+    runtime: docker
+    dockerContext: ai-eval-platform
+    dockerfilePath: ai-eval-platform/deploy/Dockerfile.web
+    plan: 0.5c-512mb
+    region: oregon
+    healthCheckPath: /
+    envVars:
+      # The nginx template substitutes these at container start. Render assigns
+      # PORT itself; `host` is the API's public hostname, without a scheme.
+      - key: API_SCHEME
+        value: https
+      - key: API_HOST
+        fromService:
+          type: web
+          name: evalforge-api
+          property: host

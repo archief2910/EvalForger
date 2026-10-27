@@ -95,6 +95,38 @@ func (s *Server) Router() http.Handler {
 			s.handleAlerts(w, r, projectID)
 		case len(rest) == 3 && rest[0] == "alerts" && rest[2] == "ack":
 			s.handleAlertAck(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "retention-rules":
+			s.handleRetentionRules(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "retention-rules":
+			s.handleRetentionRule(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "retention-rules" && rest[2] == "apply":
+			s.handleRetentionApply(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "monitors":
+			s.handleMonitors(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "monitors":
+			s.handleMonitor(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "monitors" && rest[2] == "evaluate":
+			s.handleMonitorEvaluate(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "monitor-events":
+			s.handleMonitorEvents(w, r, projectID)
+		case len(rest) == 1 && rest[0] == "custom-scorers":
+			s.handleCustomScorers(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "custom-scorers":
+			s.handleCustomScorer(w, r, projectID, rest[1])
+		case len(rest) == 3 && rest[0] == "custom-scorers" && rest[2] == "test":
+			s.handleCustomScorerTest(w, r, projectID, rest[1])
+		case len(rest) == 1 && rest[0] == "guardrail-policies":
+			s.handleGuardrailPolicies(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "guardrail-policies":
+			s.handleGuardrailPolicy(w, r, projectID, rest[1])
+		case len(rest) == 2 && rest[0] == "guardrails" && rest[1] == "check":
+			s.handleGuardrailCheck(w, r, projectID)
+		case len(rest) == 1 && rest[0] == "guardrail-events":
+			s.handleGuardrailEvents(w, r, projectID)
+		case len(rest) == 1 && rest[0] == "optimizations":
+			s.handleOptimizations(w, r, projectID)
+		case len(rest) == 2 && rest[0] == "optimizations":
+			s.handleOptimization(w, r, projectID, rest[1])
 		case len(rest) == 1 && rest[0] == "datasets":
 			s.handleDatasets(w, r, projectID)
 		case len(rest) == 1 && rest[0] == "prompts":
@@ -178,6 +210,15 @@ func (s *Server) Router() http.Handler {
 		default:
 			errJSON(w, 404, "route not found")
 		}
+	})
+
+	mux.HandleFunc("/api/v1/worker_callback/optimization/", func(w http.ResponseWriter, r *http.Request) {
+		id := strings.TrimPrefix(r.URL.Path, "/api/v1/worker_callback/optimization/")
+		if id == "" || strings.Contains(id, "/") {
+			errJSON(w, 404, "bad path")
+			return
+		}
+		s.handleOptimizationCallback(w, r, id)
 	})
 
 	mux.HandleFunc("/api/v1/worker_callback/thread/", func(w http.ResponseWriter, r *http.Request) {

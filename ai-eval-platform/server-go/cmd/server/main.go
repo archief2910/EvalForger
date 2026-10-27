@@ -55,6 +55,19 @@ func run(args []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// --create-key bootstraps the first credential of an auth-required
+	// deployment without opening an HTTP port, and without touching the
+	// telemetry plane: it is a control-plane write, and DuckDB allows one
+	// writer process, so this has to work while the server is running.
+	if hasFlag(args, "--create-key") {
+		control, err := database.OpenControl(ctx, cfg, log)
+		if err != nil {
+			return err
+		}
+		defer control.Close()
+		return createKey(api.NewControlOnly(control, cfg, log), args)
+	}
+
 	// Two engines: PostgreSQL for control metadata, DuckDB for telemetry.
 	// OpenStores migrates both, imports any pre-existing SQLite data once and
 	// backfills conversation threads.
@@ -66,13 +79,6 @@ func run(args []string) error {
 	defer stores.Telemetry.Close()
 
 	server := api.New(stores.Control, stores.Telemetry, cfg, log)
-
-	// --create-key bootstraps the first credential of an auth-required
-	// deployment without opening an HTTP port. The key goes to stdout so it can
-	// be captured; the diagnostic line goes to stderr.
-	if hasFlag(args, "--create-key") {
-		return createKey(server, args)
-	}
 
 	q := queue.New(stores.Control, server.WriteMutex(), log, cfg.JobLease, server.RunJob, server.RetireExperiment)
 	server.AttachQueue(q)

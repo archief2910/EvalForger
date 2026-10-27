@@ -293,7 +293,53 @@ func (s *Server) handleThreadDetail(w http.ResponseWriter, r *http.Request, proj
 	writeJSON(w, 200, map[string]interface{}{
 		"thread": thread, "turns": turns, "scores": scores,
 		"score_summary": summary, "evaluations": evals,
+		"online_scores": s.onlineThreadScoresForThread(r.Context(), projectID, threadID),
 	})
+}
+
+// onlineThreadScoresForThread returns the automatic scores the live rule loop
+// produced for a conversation. They are kept apart from the evaluation
+// scores because they answer a different question: what did the rule say
+// about this conversation when it closed.
+func (s *Server) onlineThreadScoresForThread(ctx context.Context, projectID, threadID string) []map[string]interface{} {
+	out := []map[string]interface{}{}
+	rows, err := s.Telemetry.QueryContext(ctx,
+		`SELECT rule_id, scorer, score, rationale, judge_mode, created_at
+		 FROM online_thread_scores WHERE project_id=? AND thread_id=? ORDER BY created_at`,
+		projectID, threadID)
+	if err != nil {
+		return out
+	}
+	defer rows.Close()
+	names := map[string]string{}
+	if rrows, err := s.DB.QueryContext(ctx,
+		`SELECT id, name FROM online_rules WHERE project_id=?`, projectID); err == nil {
+		defer rrows.Close()
+		for rrows.Next() {
+			var id, name string
+			if rrows.Scan(&id, &name) == nil {
+				names[id] = name
+			}
+		}
+	}
+	for rows.Next() {
+		var ruleID, scorer, rationale, judgeMode, createdAt string
+		var score sql.NullFloat64
+		if rows.Scan(&ruleID, &scorer, &score, &rationale, &judgeMode, &createdAt) != nil {
+			continue
+		}
+		item := map[string]interface{}{
+			"rule_id": ruleID, "rule_name": names[ruleID], "scorer": scorer,
+			"rationale": rationale, "judge_mode": judgeMode, "created_at": createdAt,
+		}
+		if score.Valid {
+			item["score"] = score.Float64
+		} else {
+			item["score"] = nil
+		}
+		out = append(out, item)
+	}
+	return out
 }
 
 func (s *Server) threadRow(projectID, threadID string) (map[string]interface{}, error) {
@@ -411,6 +457,11 @@ func (s *Server) handleThreadStatus(w http.ResponseWriter, r *http.Request, proj
 		errJSON(w, 400, err.Error())
 		return
 	}
+	// A manual close ends the conversation, so the online thread rules score
+	// it exactly as they would score one that closed on its own.
+	if action == "close" {
+		s.online.AfterThreadClose(projectID, threadID)
+	}
 	thread, err := s.threadRow(projectID, threadID)
 	if err != nil {
 		errJSON(w, 404, "thread not found")
@@ -419,7 +470,7 @@ func (s *Server) handleThreadStatus(w http.ResponseWriter, r *http.Request, proj
 	writeJSON(w, 200, map[string]interface{}{"thread": thread})
 }
 
-// sweepThreads closes idle conversations. The interval is derived from the
+// closeIdleThreads closes idle conversations. The interval is derived from the
 // configured timeout so tests and demos do not wait minutes for a sweep.
 func (s *Server) sweepThreads(ctx context.Context) {
 	idle := s.cfg.ThreadIdle
@@ -448,12 +499,34 @@ func (s *Server) sweepThreads(ctx context.Context) {
 	}
 }
 
+// closeIdleThreads closes conversations that have gone quiet and hands each one
+// to the online thread rules.
+//
+// The close is the trigger for conversation scoring: "how did this
+// conversation go" is only answerable once the conversation is over. A rule
+// that scored every turn would report a partial conversation and change its
+// meaning as more turns arrive.
 func (s *Server) closeIdleThreads(idle time.Duration) {
 	cutoff := time.Now().Add(-idle).UnixMilli()
+	now := model.NowUTC()
 	s.telemetryMu.Lock()
+	// Collect the conversations that are about to close, so the online rules
+	// can be told which ones to score.
+	rows, err := s.Telemetry.Query(`SELECT project_id, id FROM threads
+		WHERE status='open' AND last_activity_ms < ?`, cutoff)
+	closing := []struct{ projectID, threadID string }{}
+	if err == nil {
+		defer rows.Close()
+		for rows.Next() {
+			var projectID, threadID string
+			if rows.Scan(&projectID, &threadID) == nil {
+				closing = append(closing, struct{ projectID, threadID string }{projectID, threadID})
+			}
+		}
+	}
 	res, err := s.Telemetry.Exec(`UPDATE threads SET status='closed',
 		ended_at_ms=last_activity_ms, updated_at=?
-		WHERE status='open' AND last_activity_ms < ?`, model.NowUTC(), cutoff)
+		WHERE status='open' AND last_activity_ms < ?`, now, cutoff)
 	s.telemetryMu.Unlock()
 	if err != nil {
 		s.log.Warn("close idle threads", "err", err)
@@ -461,6 +534,10 @@ func (s *Server) closeIdleThreads(idle time.Duration) {
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
 		s.logf("closed idle threads", "count", n)
+	}
+	// Scoring happens after the close is durable, and off the request path.
+	for _, c := range closing {
+		s.online.AfterThreadClose(c.projectID, c.threadID)
 	}
 }
 

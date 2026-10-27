@@ -27,6 +27,7 @@ type ruleIn struct {
 	FilterName     string   `json:"filter_name"`
 	Scorers        []string `json:"scorers"`
 	AlertThreshold *float64 `json:"alert_threshold"`
+	Scope          string   `json:"scope"`
 }
 
 // recordScorers is the subset of the registry that can run on a single trace.
@@ -41,7 +42,26 @@ func recordScorers() map[string]bool {
 	return out
 }
 
-func validateRule(in ruleIn) string {
+// threadScorers is the subset of the registry that judges a conversation.
+func threadScorers() map[string]bool {
+	out := map[string]bool{}
+	for _, sc := range builtinScorers {
+		if sc["scope"] == "thread" {
+			out[sc["name"].(string)] = true
+		}
+	}
+	return out
+}
+
+// validateRule checks a rule against the registry. The scope decides which
+// scorers are allowed: a trace rule cannot name a thread scorer, and a thread
+// rule cannot name a trace scorer. Mixing them would produce a rule that
+// looks valid and silently scores nothing.
+//
+// custom holds the project's user-authored metrics. They are accepted in
+// either scope because a custom metric decides for itself what it reads; the
+// sandbox is what makes running it safe.
+func validateRule(in ruleIn, custom map[string]bool) string {
 	if strings.TrimSpace(in.Name) == "" {
 		return "name is required"
 	}
@@ -51,10 +71,23 @@ func validateRule(in ruleIn) string {
 	if len(in.Scorers) == 0 {
 		return "at least one scorer is required"
 	}
+	scope := in.Scope
+	if scope == "" {
+		scope = online.ScopeTrace
+	}
+	if scope != online.ScopeTrace && scope != online.ScopeThread {
+		return "scope must be trace or thread"
+	}
 	known := recordScorers()
+	if scope == online.ScopeThread {
+		known = threadScorers()
+	}
 	seen := map[string]bool{}
 	for _, name := range in.Scorers {
-		if !known[name] {
+		if !known[name] && !custom[name] {
+			if scope == online.ScopeThread {
+				return "unknown or non-thread scorer: " + name
+			}
 			return "unknown or non-trace scorer: " + name
 		}
 		if seen[name] {
@@ -78,7 +111,7 @@ func ruleJSON(r online.Rule) map[string]interface{} {
 	}
 	return map[string]interface{}{
 		"id": r.ID, "project_id": r.ProjectID, "name": r.Name, "enabled": r.Enabled,
-		"sample_rate": r.SampleRate,
+		"sample_rate": r.SampleRate, "scope": r.Scope,
 		"filter": map[string]string{
 			"status": r.FilterStatus, "model": r.FilterModel, "name": r.FilterName,
 		},
@@ -106,7 +139,7 @@ func (s *Server) handleOnlineRules(w http.ResponseWriter, r *http.Request, proje
 			errJSON(w, 400, "bad json: "+err.Error())
 			return
 		}
-		if msg := validateRule(in); msg != "" {
+		if msg := validateRule(in, s.customScorerNames(r.Context(), projectID)); msg != "" {
 			errJSON(w, 400, msg)
 			return
 		}
@@ -122,6 +155,10 @@ func (s *Server) handleOnlineRules(w http.ResponseWriter, r *http.Request, proje
 			ProjectID: projectID, Name: in.Name, Enabled: enabled, SampleRate: sample,
 			FilterStatus: in.FilterStatus, FilterModel: in.FilterModel, FilterName: in.FilterName,
 			Scorers: in.Scorers, AlertThreshold: thresholdOrNil(in.AlertThreshold),
+			Scope: in.Scope,
+		}
+		if rule.Scope == "" {
+			rule.Scope = online.ScopeTrace
 		}
 		if err := s.online.Insert(r.Context(), &rule); err != nil {
 			errJSON(w, 500, err.Error())
@@ -191,11 +228,14 @@ func (s *Server) handleOnlineRule(w http.ResponseWriter, r *http.Request, projec
 		if _, ok := sent["alert_threshold"]; ok {
 			rule.AlertThreshold = thresholdOrNil(in.AlertThreshold)
 		}
+		if _, ok := sent["scope"]; ok && in.Scope != "" {
+			rule.Scope = in.Scope
+		}
 		check := ruleIn{
-			Name: rule.Name, Scorers: rule.Scorers,
+			Name: rule.Name, Scorers: rule.Scorers, Scope: rule.Scope,
 			SampleRate: &rule.SampleRate, AlertThreshold: rule.AlertThreshold,
 		}
-		if msg := validateRule(check); msg != "" {
+		if msg := validateRule(check, s.customScorerNames(r.Context(), projectID)); msg != "" {
 			errJSON(w, 400, msg)
 			return
 		}
@@ -221,14 +261,11 @@ func (s *Server) handleOnlineRuleRun(w http.ResponseWriter, r *http.Request, pro
 		return
 	}
 	var in struct {
-		TraceID string `json:"trace_id"`
+		TraceID  string `json:"trace_id"`
+		ThreadID string `json:"thread_id"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 		errJSON(w, 400, "bad json: "+err.Error())
-		return
-	}
-	if in.TraceID == "" {
-		errJSON(w, 400, "trace_id is required")
 		return
 	}
 	rule, err := s.online.Get(r.Context(), projectID, ruleID)
@@ -238,6 +275,34 @@ func (s *Server) handleOnlineRuleRun(w http.ResponseWriter, r *http.Request, pro
 	}
 	if err != nil {
 		errJSON(w, 500, err.Error())
+		return
+	}
+
+	// A thread rule runs against a conversation, a trace rule against a
+	// request. Running a thread rule with a trace id would score nothing, so
+	// the scope decides which id the endpoint expects.
+	if rule.Scope == online.ScopeThread {
+		if in.ThreadID == "" {
+			errJSON(w, 400, "thread_id is required for a thread-scoped rule")
+			return
+		}
+		if err := s.requireThread(r.Context(), projectID, in.ThreadID); err != nil {
+			errJSON(w, 404, "thread not found")
+			return
+		}
+		scores, err := s.online.RunThread(r.Context(), rule, in.ThreadID)
+		if err != nil {
+			errJSON(w, 502, err.Error())
+			return
+		}
+		writeJSON(w, 200, map[string]interface{}{
+			"thread_id": in.ThreadID, "scope": rule.Scope, "scores": scoreJSONList(scores),
+		})
+		return
+	}
+
+	if in.TraceID == "" {
+		errJSON(w, 400, "trace_id is required")
 		return
 	}
 	var n int
@@ -255,19 +320,33 @@ func (s *Server) handleOnlineRuleRun(w http.ResponseWriter, r *http.Request, pro
 		errJSON(w, 502, err.Error())
 		return
 	}
+	writeJSON(w, 200, map[string]interface{}{
+		"trace_id": in.TraceID, "scope": rule.Scope, "scores": scoreJSONList(scores),
+	})
+}
+
+// requireThread reports whether a conversation exists in the project.
+func (s *Server) requireThread(ctx context.Context, projectID, threadID string) error {
+	var n int
+	return s.Telemetry.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM threads WHERE project_id=? AND id=?`, projectID, threadID).Scan(&n)
+}
+
+// scoreJSONList renders scorer results for an API response.
+func scoreJSONList(scores []online.Score) []map[string]interface{} {
 	out := make([]map[string]interface{}, 0, len(scores))
 	for _, sc := range scores {
-		item := map[string]interface{}{
+		out = append(out, map[string]interface{}{
 			"scorer": sc.Scorer, "score": sc.Score,
 			"rationale": sc.Rationale, "judge_mode": sc.JudgeMode,
-		}
-		out = append(out, item)
+		})
 	}
-	writeJSON(w, 200, map[string]interface{}{"trace_id": in.TraceID, "scores": out})
+	return out
 }
 
 type alertRow struct {
 	ID, ProjectID, RuleID, RuleName, TraceID, Scorer, Status, CreatedAt string
+	SubjectType, SubjectID                                              string
 	Score, Threshold                                                    float64
 	AcknowledgedAt                                                      sql.NullString
 }
@@ -282,7 +361,8 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request, projectID 
 		status = "open"
 	}
 	query := `SELECT a.id, a.project_id, a.rule_id, COALESCE(r.name,''), a.trace_id, a.scorer,
-		a.score, a.threshold, a.status, a.created_at, a.acknowledged_at
+		a.score, a.threshold, a.status, a.created_at, a.acknowledged_at,
+		COALESCE(a.subject_type,'trace'), COALESCE(a.subject_id, a.trace_id)
 		FROM online_alerts a LEFT JOIN online_rules r ON r.id=a.rule_id
 		WHERE a.project_id=?`
 	args := []interface{}{projectID}
@@ -302,13 +382,15 @@ func (s *Server) handleAlerts(w http.ResponseWriter, r *http.Request, projectID 
 		var a alertRow
 		var score sql.NullFloat64
 		if err := rows.Scan(&a.ID, &a.ProjectID, &a.RuleID, &a.RuleName, &a.TraceID, &a.Scorer,
-			&score, &a.Threshold, &a.Status, &a.CreatedAt, &a.AcknowledgedAt); err != nil {
+			&score, &a.Threshold, &a.Status, &a.CreatedAt, &a.AcknowledgedAt,
+			&a.SubjectType, &a.SubjectID); err != nil {
 			continue
 		}
 		item := map[string]interface{}{
 			"id": a.ID, "project_id": a.ProjectID, "rule_id": a.RuleID, "rule_name": a.RuleName,
 			"trace_id": a.TraceID, "scorer": a.Scorer, "score": score.Float64,
 			"threshold": a.Threshold, "status": a.Status, "created_at": a.CreatedAt,
+			"subject_type": a.SubjectType, "subject_id": a.SubjectID,
 		}
 		if score.Valid {
 			item["score"] = score.Float64

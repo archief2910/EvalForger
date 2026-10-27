@@ -1,4 +1,4 @@
-# Opik → EvalForge: architecture review and corrections
+﻿# Opik → EvalForge: architecture review and corrections
 
 This document is the result of reading the Opik source in [`opik/`](../../opik) (Java/Dropwizard backend, React frontend,
 Python + TypeScript SDKs) and comparing it, decision by decision, with our Go + Python platform.
@@ -72,7 +72,7 @@ These are cheap to copy and expensive to get wrong, because they are the parts a
 
 Everything below is ordered by *what breaks first when someone other than us uses it*.
 
-**Status of this pass:** D1 (partly), D2, D6, D9, D12 and D13 are implemented. The rest are decisions with a written
+**Status of this pass:** D1 (partly), D2, D6, D9, D12, D13, D14, D15, D16, D17, D18, D19 and D20 are implemented. The rest are decisions with a written
 implementation path, not code.
 
 ### Implemented since the review
@@ -89,6 +89,11 @@ implementation path, not code.
 | UI end-to-end (feedback → promote → eval → compare) | driven in a browser; dataset v3→v4, experiment completed with 7 runs, job `done attempts=1` |
 | MCP server (`--mcp`): 11 tools over stdio JSON-RPC, API-client design | `server-go/mcp.go`; `scripts/mcp_test.py` **23/23**; also driven by the official `mcp` Python SDK |
 | Control/data plane split (PostgreSQL + DuckDB), one-time SQLite import, and first-class conversations with thread-level scoring | `internal/database/{db,import,migrate,legacy}.go`, `internal/pgbind`, `internal/api/threads.go`; smoke **41/41**, fault **16/16**, auth **44/44**, MCP **23/23** |
+| Online evaluation (D14): rules over live traffic, deterministic sampling, idempotent scores, threshold alerts | `internal/online`, `internal/api/online.go`, `worker.py --online`; smoke 48/48 at the time |
+| Retention policies (D16): per-project rules, children-first sweeper, `apply_to_past` | `internal/retention`, `internal/api/retention.go`, `control/0006_retention_rules.sql`; 5 Go tests, smoke checks |
+| Windowed monitors (D17): metric-over-window state machine, webhook/Slack delivery, delivery recorded | `internal/monitor`, `internal/api/monitor.go`, `control/0007_monitors.sql`; 7 Go tests |
+| Conversation-scoped online rules (D18): score on thread close, thread alerts with a typed subject | `internal/online` (scope), `internal/api/online_thread_test.go`, `worker.py --online --thread-id`; 6 Go tests |
+| Sandboxed custom metrics (D15): Docker runner, fail-closed local runner, registry API | `internal/sandbox`, `internal/api/custom_scorers.go`; 5 sandbox tests, 7 API tests |
 | Documented corrections and roadmap | this file |
 
 ---
@@ -337,29 +342,153 @@ decision; a partial sample never becomes "score the noisy trace twice".
 windowed monitors that fire once for an aggregate condition (our alert is per score), and notification
 channels (Slack/email/PagerDuty). Those are product breadth, not protocol.
 
-### D15 — Custom Python metrics need a sandbox (decided, not built)
+### D15 — Custom Python metrics run in a sandbox (implemented)
 
-**Opik:** users write Python metrics, so the backend executes untrusted code. The answer is a disposable
-sandbox: container-per-job, no network, non-root, read-only root filesystem, memory/CPU/PID caps, hard
-timeout.
-**Us:** scorers are a fixed registry executed by a trusted worker. That is safe precisely because users
-cannot upload code.
+**Opik:** users write Python metrics, so the backend executes untrusted code. The answer is a
+disposable sandbox: container-per-job, no network, non-root, read-only root filesystem, memory/CPU/PID
+caps, hard timeout. Opik ships exactly this as `apps/opik-sandbox-executor-python`: a container that
+takes code plus a payload and runs it under a non-root user, with the runner compiled to bytecode and
+package managers removed so there is nothing to install at run time.
 
-**Decision: do not accept custom code until the sandbox exists, and build it when the feature demands it.**
-The shape is recorded now so it cannot be hand-waved later:
+**Decision: accept custom code only through a sandbox, and fail closed when there isn't one.**
 
-1. `Scorer` stays the execution boundary (online and dataset paths both use it). A sandboxed backend
-   implements the same interface; matching, persistence and API do not change.
-2. Docker flags: `--network none --read-only --user 65534:65534 --memory 256m --pids-limit 64
-   --cpus 1 --cap-drop ALL --security-opt no-new-privileges`, plus a wall-clock timeout and no secrets in
-   the container environment.
-3. The local fallback exists for development and **must fail closed** for untrusted code: it refuses to
-   run uploaded scorers unless an explicit opt-in is set, and the UI/API say so. A hardened subprocess
-   with a timeout is not a security boundary.
+We implemented the boundary rather than the feature alone:
 
-Not implemented in this pass because no customer-code path exists; adding the container backend without
-that requirement would be untested infrastructure. Verified today instead: rules cannot name a scorer
-outside the registry (400), which keeps the trusted boundary real.
+| Piece | Shape |
+|---|---|
+| Execution | `internal/sandbox`: `Runner` interface over `DockerRunner` and a refusing `LocalRunner` |
+| Flags | `--network none --read-only --user 65534:65534 --memory 256m --pids-limit 64 --cpus 1 --cap-drop ALL --security-opt no-new-privileges --tmpfs /tmp:rw,noexec,nosuid,size=16m` |
+| Contract | `def score(payload) -> float \| {score, rationale}`, or a class with a `score` method |
+| Storage | `custom_scorers` (control plane). Storing code is not running it. |
+| Boundary | `online.Engine.splitScorers` decides which names are custom, so the trusted worker never sees user code |
+| Refusal | no Docker → `503`, no score, `sandbox_available: false`; `LocalRunner` refuses unless `SANDBOX_ALLOW_UNSAFE_LOCAL=1` |
+
+What we did **not** do: a hardened subprocess on the host. A subprocess with a timeout is not a security
+boundary, and shipping one behind a friendly name is how a security model rots. The local runner exists
+for iterating on a metric on a laptop, it says so in its error message, and it logs a warning at boot.
+
+**Verified:** the runner's contract end to end (function, dict return, class form, payload reading,
+syntax error, missing `score`, raised exception, non-numeric score, out-of-range score) and the refusal
+paths (no daemon → `ErrUnavailable`; local runner → refuses; API → `503`). The Docker path itself is
+unverified on this machine because no daemon is running — stated plainly rather than implied.
+
+### D16 — Retention is a policy on the control plane, enforced on telemetry (implemented)
+
+**Opik:** `RetentionRule` per project with a retention period, `apply_to_past`, and a catch-up cursor.
+**Us (before):** telemetry was kept forever; the plane split made per-plane retention *possible* but
+nothing enforced it.
+
+**Decision: the rule is control state, the sweep is a telemetry job.** Deleting is ordered
+children-first — feedback and automatic scores reference traces, so they go before the spans, and a
+conversation whose turns are all gone goes with its scores. `apply_to_past=false` bounds the window at
+the rule's creation time, so adopting a policy cannot retroactively delete history.
+
+**Costs:** the sweep is a ticker, not a distributed job; a very large project sweeps in one transaction,
+which DuckDB handles but which would want batching at ClickHouse scale.
+
+### D17 — Monitors add a state machine to alerting (implemented)
+
+**Opik:** metric alerts with a threshold, an operator, a window, and a debouncing bucket; channels are
+general webhook / Slack / PagerDuty.
+**Us (before):** alerts were a per-score threshold. That tells you a trace scored badly, not that the
+fleet is unhealthy, and it re-fires forever while the condition holds.
+
+**Decision: a monitor is an aggregate over a window with a state machine.** `ok → firing` emits one
+event and one notification; `firing → ok` resolves it. Metrics are `error_rate`, `avg_score`,
+`avg_latency_ms`, `p95_latency_ms`, `avg_cost_usd`, `span_count`, `trace_count`, `error_count`.
+Delivery is recorded on the event (`notified`, `notification_error`), so a broken channel is visible
+rather than silent.
+
+**What we did not copy yet:** PagerDuty and email channels, and a Redis-backed debounce bucket (a single
+dispatcher and a SQL state transition are the lock here).
+
+### D18 — Conversation-scoped online evaluation (implemented)
+
+**Opik:** `TraceThreadOnlineScorerPublisher` enqueues threads when they close, and the automation-rule
+types include `trace_thread_llm_as_judge` and `trace_thread_user_defined_metric_python`.
+**Us (before):** online rules only scored single traces; the thread scorers existed but only ran from a
+manual/dataset evaluation job.
+
+**Decision: scope is part of the rule, and the trigger is the close.** A `thread` rule is evaluated when
+a conversation closes (idle sweep or manual close) and runs thread-scoped scorers through
+`worker.py --online --thread-id`. Scores land in `online_thread_scores` (unique on
+`(rule_id, thread_id, scorer)`), and an alert points at the conversation via
+`subject_type='thread'`.
+
+This is the most important parity item for agent evaluation: a single trace says "this request went
+wrong"; a conversation says "the agent forgot the user's name after turn four". Those are different
+products, and only the second one is what an agent team needs.
+
+### D19 — Guardrails are a runtime layer, not a scorer (implemented)
+
+**Opik:** a separate guardrails service (`apps/opik-guardrails-backend`) validates text against PII,
+topic, prompt-injection and custom-classifier checks, and the backend stores `Guardrail` rows attached
+to the entity that was checked.
+**Us (before):** `regex_guard` existed — an offline scorer that runs *after* the fact on a dataset or a
+trace. Nothing stopped a value from being stored or sent.
+
+**Decision: protection is a separate mechanism with an action, not a score.**
+
+| Piece | Shape |
+|---|---|
+| Checks | `PII` (email, phone, card with Luhn, SSN, IBAN, IP, URL), `PROMPT_INJECTION` (override phrasings), `TOPIC` (restrict or allow), `CUSTOM` (operator regexes and keywords) |
+| Actions | `flag` records the finding, `redact` masks before storage, `block` refuses the batch |
+| Runtime endpoint | `POST /projects/{id}/guardrails/check` — what an application calls before it sends text to a model |
+| Ingest enforcement | native and OTLP paths run the same checks before a span is written |
+| Audit | `guardrail_events` on the telemetry plane, with a redacted preview; the original is never stored |
+
+Two deliberate calls:
+
+- **The strictest policy wins.** A `block` policy is not watered down by a `flag` policy that also
+  matched, and a mixed set reports the strongest action.
+- **The event log cannot become the leak.** The preview is redacted and truncated, because a guardrail
+  that stores what it blocked has moved the problem rather than solved it.
+
+**What we did not copy:** a trained custom classifier. Opik fine-tunes a small model
+(`Qwen2.5-1.5B-Instruct`) from labelled examples and serves it. We ship a `CUSTOM` check over operator
+regexes and keywords instead, and say so: no training pipeline, no inference service. Card detection is
+gated on the Luhn checksum so order numbers are not reported as PII — a guardrail that cries wolf gets
+switched off.
+
+### D20 — Optimization closes the loop by changing something (implemented)
+
+**Opik:** Optimization Studio runs `opik_optimizer` in a separate Python worker over a dataset and
+metrics, tries prompt variants, and records an `Optimization` row with baseline and best objective
+scores. It is a separate worker because optimization is long-running and compute-heavy.
+**Us (before):** the loop stopped at "compare experiments". Nothing produced a better prompt.
+
+**Decision: a durable job that proposes, measures and promotes.**
+
+```
+POST /optimizations  (dataset snapshot + baseline prompt + scorers pinned)
+        │
+        ▼
+ jobs.kind='optimize' ──► worker.py --optimize
+                             │  baseline + candidate strategies
+                             │  (concise, step_by_step, grounded, structured, no_hedge)
+                             ▼
+                     score every candidate on the same snapshot
+                             │
+                             ▼
+              POST /worker_callback/optimization/{id}
+                             │
+                             ▼
+        better than baseline? ──► new prompt version ("optimized: <run>")
+                             └─► tie or worse: recorded, discarded
+```
+
+- **Pinned inputs.** The dataset snapshot, baseline prompt version and scorer list are stored on the
+  run, so re-reading the live table cannot change what was measured.
+- **Promotion is conditional.** A candidate that ties or loses is reported and never becomes a prompt.
+  This is the difference between a search and a rubber stamp.
+- **The job is durable.** It goes through the same claim/lease/reaper queue as evaluations, so a restart
+  mid-run does not strand it; a failed run records its reason on the row.
+- **The winner is a normal prompt version**, listed by `GET /prompts/{id}`, so the existing experiment
+  flow can pin and compare it.
+
+**What we did not copy:** a learned optimizer. Opik's `opik_optimizer` supports evolutionary and
+few-shot strategies; ours is a fixed set of instruction mutations measured honestly. That is a real
+capability with an honest ceiling, rather than a claim of parity.
 
 ### D12 — Reject these, with reasons
 
@@ -370,7 +499,8 @@ outside the registry (400), which keeps the trusted boundary real.
 | 40 JAX-RS resources before the core loop is correct | Breadth without depth; annotation queues and automation rules are meaningless without reliable ingest |
 | Redisson distributed locks | Single dispatcher; PostgreSQL transactions + unique constraints are the lock |
 | Base64-ing OTel ids in Redis as an id-map | We can key spans by the OTel span id directly; no mapping table needed |
-| Separate Python backend for guardrails | We already have a Python worker; another service is a second deploy for one feature |
+| Separate Python backend for guardrails | Guardrails are a request-path decision with an action; a second service would add a network hop to the hot path for checks that are regexes and word lists. In-process is faster and simpler. (The sandbox *is* separate, because it runs untrusted code — a different problem.) |
+| A learned prompt optimizer | A fixed set of measured instruction mutations is honest and testable; claiming evolutionary search without the library behind it would not be |
 
 ---
 
@@ -466,11 +596,15 @@ Ordered by *what makes the product real*, not by what is fun to build. Each item
 | # | Gap | Acceptance criterion |
 |---|---|---|
 | 10 | Embedded DuckDB telemetry | ClickHouse behind the same plane boundary; migration documented and benchmarked |
-| 11 | No retention | Per-project retention rule deletes spans older than N days on a schedule; dashboard reflects it |
+| 11 | ~~No retention~~ **done** | Per-project policy expires spans, feedback, scores and empty conversations on a schedule; `apply_to_past` bounds it at rule creation |
 | 12 | ~~No online evaluation~~ **done** | A rule "on every new trace in project X, run scorer Y" produces scores without a human — implemented (`online_rules`, `online_scores`, `--online` worker mode) |
-| 13 | Alerting is threshold-only | Score-below-threshold alerts exist; a windowed monitor (`error_rate > 5%` for 15 min, fires once) does not |
+| 13 | ~~Alerting is threshold-only~~ **done** | Windowed monitors with `ok/firing` state fire once and resolve; webhook and Slack channels; delivery results recorded |
 | 14 | No OpenAPI contract | `openapi.json` generated from handlers; a TS client generated from it compiles in CI |
 | 15 | No metering | Spans ingested, scores computed, and bytes stored are attributable per workspace per day |
+| 16 | ~~No conversation-level online scoring~~ **done** | A `thread`-scoped rule scores a conversation when it closes; alerts carry `subject_type='thread'` |
+| 17 | ~~No custom Python metrics~~ **done** | `custom_scorers` + a Docker sandbox that fails closed; the trusted worker never sees user code |
+| 18 | ~~No runtime safety layer~~ **done** | Per-project guardrail policies with flag/redact/block, enforced on ingest and exposed as a pre-flight check; audit events store a redacted preview |
+| 19 | ~~No optimization loop~~ **done** | A durable `optimize` job measures a baseline and prompt candidates on a pinned snapshot and promotes the winner only when it improved |
 
 ---
 
@@ -478,13 +612,17 @@ Ordered by *what makes the product real*, not by what is fun to build. Each item
 
 - **Annotation queues** (human review workflow with locking — see `AnnotationQueueItemLockService`). Ours is a thumbs
   button; review is a queue, a routing rule, and an audit trail.
-- **Automation rules / online evaluators**: implemented in D14 — filters, sampling, automatic scores.
-- **Alerts + monitors** with state (firing/resolved): score-threshold alerts are implemented; aggregate,
-  windowed monitors are not.
-- **Optimizations** (prompt/agent optimization loops) — Opik has a whole Python package; we have nothing.
+- **Automation rules / online evaluators**: implemented in D14 — filters, sampling, automatic scores — and
+  extended in D18 to conversation scope.
+- **Alerts + monitors** with state (firing/resolved): implemented in D17 — windowed aggregate conditions,
+  one event per episode, webhook and Slack delivery with the result recorded on the event. PagerDuty and
+  email channels are not implemented.
+- **Optimizations** (prompt/agent optimization loops) — implemented in D20 for prompt variants; no
+  agent-graph or few-shot-demo search.
 - **Attachments** (images, audio, JSON blobs) on spans — needs object storage.
-- **Workspaces + RBAC + API keys** — the actual boundary that makes "multi-tenant" true.
-- **Retention policies** and cost controls.
+- **Workspaces + RBAC + API keys** — the actual boundary that makes "multi-tenant" true. We have API keys
+  with scopes and OAuth 2.1 for MCP clients, but no orgs, teams or a session login.
+- **Retention policies** — implemented in D16.
 - **SDKs** (Python/TS tracing) with batching, offline buffering, and idempotent flush. Our `sdk/sample_client.py` is a
   demo, not an SDK.
 
@@ -514,3 +652,4 @@ reviewer) produce the right shape:
 8. **Shutdown:** "On SIGINT/SIGTERM: stop accepting, drain with a bounded context, close the DB."
 
 Each of those is one prompt, produces reviewable code in minutes, and is exactly what the reference boilerplate does.
+

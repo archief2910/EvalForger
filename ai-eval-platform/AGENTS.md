@@ -1,4 +1,4 @@
-# AGENTS.md
+﻿# AGENTS.md
 
 EvalForge — LLM observability + evaluation platform. Go API server, Python eval worker, React frontend.
 
@@ -21,6 +21,7 @@ If baseline verification is failing, repair that first before adding new scope.
 |-----------------|---------------------------|-------------------------------------|
 | API Server      | `server-go/cmd/server` + `server-go/internal/` | Go, net/http, pgx (PostgreSQL), go-duckdb |
 | Eval Worker     | `worker-py/worker.py`     | Python 3.12, stdlib only            |
+| Sandbox         | `server-go/internal/sandbox` | Docker container per custom metric; fails closed when Docker is absent |
 | Frontend        | `frontend/`               | React 19 + Vite, hand-written CSS   |
 | SDK sample      | `sdk/sample_client.py`    | Proves the ingestion surface        |
 | Tests           | `scripts/`                | smoke, auth, fault, load, MCP       |
@@ -42,7 +43,27 @@ If baseline verification is failing, repair that first before adding new scope.
 - `feature_list.json` — Feature state tracker (source of truth)
 - `progress.md` — Session continuity log
 - `init.sh` — Standard startup and verification path
+- `DEPLOY.md` — Docker deployment guide (compose stack, demo script, security notes)
 - `session-handoff.md` — Optional, for larger sessions
+
+## Deployment
+
+Three services in `docker-compose.yml` (Postgres, API + eval worker, nginx-served console) and three
+one-shot tools behind the `tools` profile (`seed`, `create-key`, `pull-sandbox`).
+
+```bash
+docker compose up --build -d
+docker compose run --rm seed
+open http://localhost:8080
+```
+
+Read `DEPLOY.md` before changing anything under `deploy/`. Two constraints are load-bearing:
+
+- The server image installs the **docker CLI** and mounts the host socket so custom metrics run in their
+  own container. `SANDBOX_WORK_DIR` and its bind mount must stay the **same absolute path** on both sides,
+  because the daemon resolves `-v` paths on the host, not inside the API container.
+- `--create-key` opens **only** the control plane (`database.OpenControl`). DuckDB admits one writer per
+  file, so a maintenance command that opened telemetry would fail against a running server.
 
 ## Definition of Done
 
@@ -50,7 +71,7 @@ A feature is done only when ALL of the following are true:
 
 - [ ] Target behavior is implemented
 - [ ] Go tests pass: `cd server-go && go test ./...`
-- [ ] Smoke tests pass: `python scripts/smoke_api.py` (41 checks)
+- [ ] Smoke tests pass: `python scripts/smoke_api.py` (69 checks)
 - [ ] Auth tests pass: `python scripts/auth_test.py` (44 checks)
 - [ ] MCP tests pass: `python scripts/mcp_test.py` (23 checks)
 - [ ] Evidence recorded in `feature_list.json` or `progress.md`
@@ -92,3 +113,6 @@ If you encounter:
 - **Unclear requirements**: Check the README or ask user
 - **Repeated test failures**: Update progress, flag for human review
 - **Scope ambiguity**: Re-read `feature_list.json` for definition of done
+
+
+

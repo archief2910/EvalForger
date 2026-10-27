@@ -1,4 +1,4 @@
-import React from "react";
+﻿import React from "react";
 import { createRoot } from "react-dom/client";
 import { createBrowserRouter, RouterProvider, Outlet } from "react-router-dom";
 import "./theme.css";
@@ -14,6 +14,8 @@ import Experiments from "./pages/Experiments.jsx";
 import ExperimentDetail from "./pages/ExperimentDetail.jsx";
 import Prompts from "./pages/Prompts.jsx";
 import Online from "./pages/Online.jsx";
+import Monitors from "./pages/Monitors.jsx";
+import Optimize from "./pages/Optimize.jsx";
 import { Sidebar } from "./components/Layout.jsx";
 
 function Layout() {
@@ -44,8 +46,11 @@ const router = createBrowserRouter([
       { path: "projects/:pid/experiments/:eid", element: <ExperimentDetail /> },
       { path: "projects/:pid/prompts", element: <Prompts /> },
       { path: "projects/:pid/online", element: <Online /> },
+      { path: "projects/:pid/monitors", element: <Monitors /> },
+      { path: "projects/:pid/optimize", element: <Optimize /> },
     ],
   },
 ]);
 
 createRoot(document.getElementById("root")).render(<RouterProvider router={router} />);
+

@@ -36,10 +36,20 @@ type Config struct {
 	// load; Timeout bounds one trace so a slow judge cannot pin a slot forever.
 	OnlineConcurrency int
 	OnlineTimeout     time.Duration
-	PythonBin         string
-	LegacyDB          string
-	MCPAPIBase        string
-	MCPAPIKey         string
+	// RetentionSweep is how often per-project retention policies are enforced.
+	RetentionSweep time.Duration
+	// MonitorInterval is how often windowed monitors are evaluated.
+	MonitorInterval time.Duration
+	// SandboxImage is the interpreter image custom metrics run in, and
+	// SandboxUnsafeLocal opts into a local subprocess for development. The
+	// local path is not an isolation boundary; it exists so a metric can be
+	// iterated on without Docker, and it is never the default.
+	SandboxImage       string
+	SandboxUnsafeLocal bool
+	PythonBin          string
+	LegacyDB           string
+	MCPAPIBase         string
+	MCPAPIKey          string
 
 	// ServerBaseURL is the origin this process is reachable at, derived from
 	// Addr unless overridden. The worker and MCP client use it to call back.
@@ -52,19 +62,23 @@ func Load() (Config, error) {
 	LoadDotEnv()
 
 	c := Config{
-		Addr:              env("ADDR", ":8000"),
-		DataDir:           env("DATA_DIR", filepath.Join("..", "data")),
-		AuthMode:          strings.ToLower(env("AUTH_MODE", "off")),
-		PublicBaseURL:     strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
-		WorkerPath:        env("WORKER_PATH", filepath.Join("..", "worker-py", "worker.py")),
-		WorkerTimeout:     12 * time.Minute,
-		JobLease:          45 * time.Second,
-		ThreadIdle:        30 * time.Minute,
-		OnlineConcurrency: 2,
-		OnlineTimeout:     3 * time.Minute,
-		PythonBin:         env("PYTHON_BIN", "python"),
-		LegacyDB:          os.Getenv("LEGACY_DB"),
-		MCPAPIKey:         os.Getenv("MCP_API_KEY"),
+		Addr:               listenAddr(),
+		DataDir:            env("DATA_DIR", filepath.Join("..", "data")),
+		AuthMode:           strings.ToLower(env("AUTH_MODE", "off")),
+		PublicBaseURL:      strings.TrimRight(os.Getenv("PUBLIC_BASE_URL"), "/"),
+		WorkerPath:         env("WORKER_PATH", filepath.Join("..", "worker-py", "worker.py")),
+		WorkerTimeout:      12 * time.Minute,
+		JobLease:           45 * time.Second,
+		ThreadIdle:         30 * time.Minute,
+		OnlineConcurrency:  2,
+		OnlineTimeout:      3 * time.Minute,
+		RetentionSweep:     time.Hour,
+		MonitorInterval:    time.Minute,
+		SandboxImage:       env("SANDBOX_IMAGE", "python:3.12-slim"),
+		SandboxUnsafeLocal: os.Getenv("SANDBOX_ALLOW_UNSAFE_LOCAL") == "1",
+		PythonBin:          env("PYTHON_BIN", "python"),
+		LegacyDB:           os.Getenv("LEGACY_DB"),
+		MCPAPIKey:          os.Getenv("MCP_API_KEY"),
 	}
 
 	// Two engines, matching the plane split: PostgreSQL holds the small,
@@ -108,6 +122,20 @@ func Load() (Config, error) {
 		}
 		c.OnlineTimeout = time.Duration(n) * time.Second
 	}
+	if v := os.Getenv("RETENTION_SWEEP_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("RETENTION_SWEEP_SECONDS must be a positive integer, got %q", v)
+		}
+		c.RetentionSweep = time.Duration(n) * time.Second
+	}
+	if v := os.Getenv("MONITOR_INTERVAL_SECONDS"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("MONITOR_INTERVAL_SECONDS must be a positive integer, got %q", v)
+		}
+		c.MonitorInterval = time.Duration(n) * time.Second
+	}
 
 	level := env("LOG_LEVEL", "info")
 	if err := c.LogLevel.UnmarshalText([]byte(level)); err != nil {
@@ -149,6 +177,12 @@ func (c Config) Validate() error {
 	}
 	if c.ThreadIdle < time.Second {
 		return fmt.Errorf("thread idle timeout must be at least 1s")
+	}
+	if c.RetentionSweep < time.Second {
+		return fmt.Errorf("retention sweep interval must be at least 1s")
+	}
+	if c.MonitorInterval < time.Second {
+		return fmt.Errorf("monitor interval must be at least 1s")
 	}
 	if c.WorkerPath == "" {
 		return fmt.Errorf("WORKER_PATH must not be empty")
@@ -229,4 +263,22 @@ func env(key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// listenAddr resolves the bind address.
+//
+// ADDR wins when set. Otherwise a platform-assigned PORT is used, because that
+// is the contract Render, Fly, Cloud Run and Heroku all use: the process must
+// listen on the port it was given. Local runs and Compose fall back to :8000.
+func listenAddr() string {
+	if v := os.Getenv("ADDR"); v != "" {
+		return v
+	}
+	if p := strings.TrimSpace(os.Getenv("PORT")); p != "" {
+		if strings.HasPrefix(p, ":") {
+			return p
+		}
+		return ":" + p
+	}
+	return ":8000"
 }

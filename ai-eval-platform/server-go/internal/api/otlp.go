@@ -392,6 +392,37 @@ func (s *Server) handleOTLPTraces(w http.ResponseWriter, r *http.Request, pathPr
 		}
 	}
 	threads := map[string]bool{}
+	// Guardrails run before any span is written, for the same reason as the
+	// native ingest path: a blocked value must never become a stored row.
+	if policies, err := s.enabledGuardrails(projectID); err == nil && len(policies) > 0 {
+		var blocked guardrailDecision
+		for i := range rows {
+			row := &rows[i]
+			inDec := s.applyGuardrails(projectID, row.TraceID, row.ID, asGuardrailText(row.Input), policies)
+			outDec := s.applyGuardrails(projectID, row.TraceID, row.ID, asGuardrailText(row.Output), policies)
+			if inDec.Action == "redact" && row.Input != nil {
+				row.Input = inDec.Redacted
+			}
+			if outDec.Action == "redact" && row.Output != nil {
+				row.Output = outDec.Redacted
+			}
+			if blocked.Action != "block" {
+				if inDec.Action == "block" {
+					blocked = inDec
+				} else if outDec.Action == "block" {
+					blocked = outDec
+				}
+			}
+		}
+		if blocked.Action == "block" {
+			s.telemetryMu.Unlock()
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]interface{}{
+				"error": "guardrail blocked this batch", "policy": blocked.Policy,
+				"findings": blocked.Findings,
+			})
+			return
+		}
+	}
 	for i := range rows {
 		row := &rows[i]
 		if th := explicit[row.TraceID]; th != "" {

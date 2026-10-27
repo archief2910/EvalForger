@@ -1,0 +1,16 @@
+# Build context is the repository root for both images, so this file keeps the
+# context small: node_modules alone is hundreds of megabytes the image does not
+# need (the web image installs its own).
+**/node_modules
+**/dist
+**/.git
+**/.env
+**/*.log
+data/
+screenshots/
+opik/
+rea/
+**/*.exe
+**/__pycache__
+**/.venv
+**/*.duckdb

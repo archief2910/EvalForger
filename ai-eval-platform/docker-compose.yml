@@ -1,0 +1,158 @@
+# EvalForge, deployable in one command:
+#
+#   docker compose up --build -d
+#   docker compose run --rm seed        # demo data
+#   open http://localhost:8080
+#
+# Three long-running services (database, API + eval worker, web console) and two
+# one-shot tools (seed, create-key) behind the `tools` profile.
+#
+# The API and the evaluation worker share one container on purpose: the server
+# spawns worker.py as a subprocess, so separating them would mean inventing an
+# RPC between two halves of the same program.
+
+name: evalforge
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: evalforge
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-evalforge}
+      POSTGRES_DB: evalforge
+    volumes:
+      - control-data:/var/lib/postgresql/data
+    healthcheck:
+      # The API refuses to start without a reachable database, so the point of
+      # this probe is to hold `server` back until the first connection works.
+      test: ["CMD-SHELL", "pg_isready -U evalforge -d evalforge"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+    restart: unless-stopped
+
+  server:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.server
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.27-bookworm}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      CONTROL_DB_URL: postgres://evalforge:${POSTGRES_PASSWORD:-evalforge}@postgres:5432/evalforge?sslmode=disable
+      CONTROL_DB_SCHEMA: public
+      TELEMETRY_DB_PATH: /data/telemetry.duckdb
+      DATA_DIR: /data
+      ADDR: ":8000"
+      # `off` is the right default for a demo or a review; set `AUTH_MODE=required`
+      # and mint a key with `docker compose run --rm create-key` before exposing
+      # this to a network you do not control.
+      AUTH_MODE: ${AUTH_MODE:-off}
+      # Must be the URL a browser reaches, because it appears in OAuth discovery.
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-http://localhost:8080}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      # Provider for LLM judges and the optimizer. Without a key the worker
+      # falls back to labelled deterministic heuristics, and optimisation
+      # candidates all score the same.
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
+      # Custom-metric sandbox.
+      SANDBOX_IMAGE: ${SANDBOX_IMAGE:-python:3.12-slim}
+      # Deliberately the SAME path on both sides of the mount below. The daemon
+      # resolves `docker run -v` paths on the host, so the staging directory has
+      # to be a path both the API container and the daemon agree on.
+      SANDBOX_WORK_DIR: /var/lib/evalforge/sandbox
+      MONITOR_INTERVAL_SECONDS: ${MONITOR_INTERVAL_SECONDS:-60}
+      RETENTION_SWEEP_SECONDS: ${RETENTION_SWEEP_SECONDS:-3600}
+    volumes:
+      # Telemetry (spans, conversations, scores) and one-time legacy imports.
+      - telemetry-data:/data
+      # The docker CLI inside this container talks to the host daemon. See the
+      # security note in DEPLOY.md: this is what lets a custom metric run in its
+      # own container, and it is also the most privileged thing here.
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/evalforge/sandbox:/var/lib/evalforge/sandbox
+    ports:
+      # Exposed for OTLP exporters and SDKs. The UI goes through `web`.
+      - "${API_PORT:-8000}:8000"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.web
+    depends_on:
+      server:
+        # The SPA is served either way; waiting for health just avoids a first
+        # page load that cannot reach the API yet.
+        condition: service_healthy
+    environment:
+      # The same variables the nginx template substitutes on Render. Here they
+      # point at the Compose network and the container port.
+      PORT: "80"
+      API_SCHEME: http
+      API_HOST: server:8000
+    ports:
+      - "${WEB_PORT:-8080}:80"
+    restart: unless-stopped
+
+  # ---- one-shot tools -------------------------------------------------------
+  # `docker compose run --rm seed` loads the demo project. It is a pure API
+  # client, so it waits for the API to be healthy; the profile keeps it out of
+  # a plain `up`.
+  seed:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.server
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.27-bookworm}
+    profiles: ["tools"]
+    depends_on:
+      server:
+        condition: service_healthy
+    entrypoint: ["python3", "/app/worker-py/seed.py", "--base", "http://server:8000"]
+    environment:
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-}
+    restart: "no"
+
+  # `docker compose run --rm pull-sandbox` fetches the interpreter image a
+  # custom metric runs in, so the first metric run is not a cold pull.
+  pull-sandbox:
+    image: docker:cli
+    profiles: ["tools"]
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: ["docker", "pull", "${SANDBOX_IMAGE:-python:3.12-slim}"]
+    restart: "no"
+
+  # `docker compose run --rm create-key` prints the first API key. It needs a
+  # fresh database handle and no HTTP port, which is exactly what the flag does.
+  create-key:
+    build:
+      context: .
+      dockerfile: deploy/Dockerfile.server
+      args:
+        GO_IMAGE: ${GO_IMAGE:-golang:1.27-bookworm}
+    profiles: ["tools"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: ["/app/evalforge", "--create-key", "demo"]
+    environment:
+      CONTROL_DB_URL: postgres://evalforge:${POSTGRES_PASSWORD:-evalforge}@postgres:5432/evalforge?sslmode=disable
+      CONTROL_DB_SCHEMA: public
+      TELEMETRY_DB_PATH: /data/telemetry.duckdb
+      DATA_DIR: /data
+      AUTH_MODE: ${AUTH_MODE:-required}
+    volumes:
+      - telemetry-data:/data
+    restart: "no"
+
+volumes:
+  control-data:
+  telemetry-data:

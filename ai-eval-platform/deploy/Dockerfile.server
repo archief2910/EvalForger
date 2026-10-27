@@ -1,0 +1,64 @@
+# EvalForge API server + evaluation worker.
+#
+# Two stages, one image. The server spawns `worker.py` as a subprocess, so the
+# runtime image needs both the Go binary and a Python interpreter; splitting
+# them into two containers would mean inventing an RPC between them for no
+# benefit at this size.
+#
+# Build context is the repository root (see docker-compose.yml), because the
+# image ships both server-go/ and worker-py/.
+# syntax=docker/dockerfile:1
+
+# Go 1.27 is what go.mod requires. Override if your registry lags behind:
+#   docker build --build-arg GO_IMAGE=golang:1.26-bookworm ...
+ARG GO_IMAGE=golang:1.27-bookworm
+
+FROM ${GO_IMAGE} AS builder
+WORKDIR /src
+
+# go-duckdb links a prebuilt static DuckDB (C++), so cgo needs a C toolchain.
+# The non-alpine golang images are based on buildpack-deps, which has gcc/g++.
+ENV CGO_ENABLED=1 \
+    GOOS=linux \
+    GOFLAGS=-trimpath
+
+# Dependencies first: the module cache layer survives edits to the source.
+COPY server-go/go.mod server-go/go.sum ./
+RUN go mod download
+
+COPY server-go/ ./
+RUN go build -ldflags "-s -w" -o /out/evalforge ./cmd/server \
+    && go version
+
+FROM python:3.12-slim-bookworm AS runtime
+
+# The docker CLI, for the custom-metric sandbox. The daemon is NOT installed:
+# the sandbox runs containers through whatever socket is mounted in, which
+# keeps this image small and the isolation boundary outside it.
+COPY --from=docker:cli /usr/local/bin/docker /usr/local/bin/docker
+
+# libstdc++ ships with the slim base, which is what the cgo-linked DuckDB needs.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY --from=builder /out/evalforge /app/evalforge
+COPY worker-py/ /app/worker-py/
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHON_BIN=python3 \
+    WORKER_PATH=/app/worker-py/worker.py \
+    ADDR=:8000 \
+    DATA_DIR=/data \
+    TELEMETRY_DB_PATH=/data/telemetry.duckdb
+
+# Telemetry (the DuckDB file) and one-time imports live here.
+VOLUME ["/data"]
+EXPOSE 8000
+
+# No curl in the slim image, so the probe is Python.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=25s --retries=5 \
+    CMD python3 -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3).status==200 else 1)"
+
+CMD ["/app/evalforge"]

@@ -385,10 +385,163 @@ POST spans:ingest / OTLP
 | `POST /projects/{id}/alerts/{alert}/ack` | acknowledge an alert (idempotent) |
 
 The trace view (`online_scores`) and the dashboard's online block are built from those same reads.
-**Limits:** rules only see traffic that arrives after they are created; scoring is one subprocess per
-trace, not a streaming evaluator; there is no notification channel (Slack/email) and no
-firing/resolved monitor state beyond acknowledgement. Custom Python scorers are still not accepted —
-the sandbox that would make user code safe is a separate feature (see OPIK_ALIGNMENT D15).
+
+### Conversation scope
+
+A rule has a **scope**. A `trace` rule scores one request as it arrives. A `thread` rule scores the
+whole conversation when it closes, because "how did this conversation go" is only answerable once the
+conversation is over — a rule that scored every turn would report a partial conversation whose meaning
+changes as more turns arrive.
+
+```
+thread closes (idle sweep or POST /threads/{id}/close)
+      │
+      ▼
+ rule(scope=thread) ──► sampling ──► worker.py --online --thread-id ──► online_thread_scores (DuckDB)
+                                     thread scorers (5)                  │
+                                                                         ▼
+                                                          score < threshold → online_alerts
+                                                          (subject_type=thread, subject_id=<thread>)
+```
+
+Alerts therefore carry a **typed subject** rather than assuming a trace: `subject_type` is `trace` or
+`thread`, and `subject_id` is the id to open. The uniqueness key moved from `(rule_id, trace_id,
+scorer)` to `(rule_id, subject_type, subject_id, scorer)`, because a thread alert has no trace id and
+two conversations breaching the same rule must not collide on an empty string.
+
+### Monitors — aggregate conditions over a window
+
+A per-trace rule answers "is this response good?". A monitor answers "is the fleet healthy right now?":
+
+```
+every MONITOR_INTERVAL_SECONDS
+      │
+      ▼
+ read metric over window (DuckDB)  ──►  compare to threshold  ──►  state machine
+                                        (>, <)                    ok ──► firing  (one event, notify)
+                                                                  firing ──► ok (resolve)
+```
+
+The state machine is the product decision: **a monitor that stays in breach produces one event, not one
+per tick**, and it resolves when the metric recovers. Metrics are `error_rate`, `avg_score`,
+`avg_latency_ms`, `p95_latency_ms`, `avg_cost_usd`, `span_count`, `trace_count`, `error_count`.
+
+Notification channels are `webhook` (JSON with an optional HMAC-SHA256 signature header) and `slack`
+(Slack message payload). Delivery happens on the state transition, and the outcome is recorded on the
+event (`notified`, `notification_error`) so a failed notification is visible instead of silent.
+
+### Retention
+
+A retention rule is control-plane configuration; the sweeper it drives works on telemetry:
+
+```
+retention_rules (PostgreSQL) ──► sweeper (RETENTION_SWEEP_SECONDS)
+                                   │
+                                   ▼
+             spans older than N days  ──►  feedback + online scores of gone traces
+                                        ──►  conversations with no turns left
+```
+
+`apply_to_past=false` bounds the sweep at the rule's creation time, so a new policy cannot delete data
+that was already there. Deleting is ordered children-first: feedback and scores reference traces, so
+they go before the spans, and a conversation whose turns are all gone goes with its scores.
+
+### Custom metrics and the sandbox
+
+A user-authored metric is arbitrary Python, so it gets its own execution boundary:
+
+```
+POST /custom-scorers ──► custom_scorers (PostgreSQL, code stored, never run)
+                                  │
+                 rule names the metric
+                                  ▼
+             sandbox.Runner ──► docker run --network none --read-only ...
+                                  │          --user 65534 --memory 256m --pids-limit 64
+                                  ▼          --cap-drop ALL --no-new-privileges
+                        {score, rationale} ──► online_scores
+```
+
+- The metric contract is `def score(payload) -> float | {score, rationale}`, or a class with a
+  `score` method. A trace payload carries `{input, output, expected}`; a conversation payload carries
+  `{turns: [...]}`.
+- **The engine decides which names are custom** (`online.Engine.splitScorers`), so the trusted worker is
+  never handed user code and the sandbox never sees rules or scoring policy.
+- **Fail closed.** If Docker is not reachable, a custom metric does not run: the API returns `503`, the
+  evaluation records the error, and `GET /custom-scorers` reports `sandbox_available: false`. The local
+  subprocess runner refuses unless `SANDBOX_ALLOW_UNSAFE_LOCAL=1` is set, and logs that it is not an
+  isolation boundary.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET/POST /projects/{id}/retention-rules` | list / create a policy |
+| `PATCH/DELETE /projects/{id}/retention-rules/{rule}` | edit or delete a policy |
+| `POST /projects/{id}/retention-rules/{rule}/apply` | enforce one policy now, returning deletion counts |
+| `GET/POST /projects/{id}/monitors` | list / create a windowed monitor |
+| `GET/PATCH/DELETE /projects/{id}/monitors/{monitor}` | inspect, edit, delete |
+| `POST /projects/{id}/monitors/{monitor}/evaluate` | evaluate now (state transitions still apply) |
+| `GET /projects/{id}/monitor-events` | firing and resolved episodes |
+| `GET/POST /projects/{id}/custom-scorers` | list / register a user metric; reports sandbox availability |
+| `GET/DELETE /projects/{id}/custom-scorers/{name}` | inspect or remove |
+| `POST /projects/{id}/custom-scorers/{name}/test` | run once in the sandbox; `503` if unavailable |
+
+**Limits:** a monitor is evaluated on a ticker, not from a streaming aggregate; notification channels are
+webhook and Slack (no email or PagerDuty); the sandbox is one container per metric run, so its latency is
+container-start latency; and custom metrics are scored through the online path (the dataset experiment
+path still uses the trusted registry).
+
+### Runtime guardrails
+
+Evaluation and protection are different jobs. A scorer answers "was this response good?"; a guardrail
+answers "may this text leave the application at all?".
+
+```
+ingest (native / OTLP) ──┐
+                          ├──► guardrail policies ──► action
+POST /guardrails/check ───┘        (flag|redact|block)
+                                        │
+                                        ▼
+                            guardrail_events (DuckDB, redacted preview)
+```
+
+- **Checks:** `PII` (email, phone, card with Luhn, SSN, IBAN, IP, URL), `PROMPT_INJECTION`,
+  `TOPIC` (restrict or allow), `CUSTOM` (operator regexes and keywords).
+- **Actions:** `flag` records, `redact` masks before storage, `block` refuses the batch (native ingest and
+  OTLP both return `422` and write nothing). The strictest matching policy wins.
+- **The audit log is redacted.** An event stores the check type and a masked, truncated preview, never
+  the matched value — otherwise the guardrail becomes the leak.
+- **Not a classifier.** `CUSTOM` is regexes and keywords, not a trained model; the docs say so.
+
+### Optimization loop
+
+```
+POST /optimizations (dataset snapshot + baseline prompt + scorers pinned)
+        │
+        ▼
+ jobs.kind='optimize' ──► worker.py --optimize
+                            │  baseline + candidates (concise, step_by_step,
+                            │  grounded, structured, no_hedge)
+                            ▼
+                    score each on the same snapshot
+                            │
+                            ▼
+            POST /worker_callback/optimization/{id}
+                            │
+        improved? ──► new prompt version ("optimized: <run>")
+        tie/worse ──► recorded, discarded
+```
+
+- **Pinned inputs** make the comparison fair and reproducible.
+- **Conditional promotion** is the point: a candidate that ties or loses never becomes a prompt.
+- The job uses the same durable queue as evaluations, so a restart does not strand a run.
+
+| Endpoint | Purpose |
+|---|---|
+| `GET/POST /projects/{id}/guardrail-policies` | list / create a policy |
+| `GET/PATCH/DELETE /projects/{id}/guardrail-policies/{policy}` | inspect, edit, delete |
+| `POST /projects/{id}/guardrails/check` | runtime check: allow / flag / redact / block |
+| `GET /projects/{id}/guardrail-events` | recent decisions (redacted previews) |
+| `GET/POST /projects/{id}/optimizations` | list / start a run |
+| `GET /projects/{id}/optimizations/{run}` | run detail, candidate scores and the winning prompt |
 
 ---
 
